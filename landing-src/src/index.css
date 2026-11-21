@@ -1,38 +1,41 @@
 @import "tailwindcss";
 @import "@fontsource-variable/inter";
 @import "@fontsource-variable/geist-mono";
-
-@custom-variant dark (&:is(.dark *));
+@import "@fontsource-variable/archivo/wdth.css";
 
 @theme inline {
   --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "Geist Mono Variable", ui-monospace, monospace;
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --color-card: var(--card);
-  --color-card-foreground: var(--foreground);
-  --color-primary: var(--primary);
-  --color-primary-foreground: var(--primary-foreground);
-  --color-muted: var(--muted);
-  --color-muted-foreground: var(--muted-foreground);
-  --color-accent: var(--accent);
-  --color-accent-foreground: var(--foreground);
-  --color-border: var(--border);
-  --color-ring: var(--ring);
-  --color-brand: var(--brand);
-  --animate-beam: beam 3.2s linear infinite;
-  --animate-shimmer: shimmer 2.4s linear infinite;
+  --font-display: "Archivo Variable", "Inter Variable", sans-serif;
+  --color-ink: #050505;
+  --color-line: #ffffff1f;
+  --color-dim: #8a8a8a;
+  --color-faint: #5a5a5a;
 }
-:root {
-  --background: #09090b; --foreground: #ededef; --card: #0f0f12;
-  --primary: #ededef; --primary-foreground: #09090b;
-  --muted: #18181b; --muted-foreground: #8b8b95;
-  --accent: #1c1c21; --border: #ffffff14; --ring: #7eb6ff; --brand: #7eb6ff;
+html { scroll-behavior: smooth; color-scheme: dark; }
+body { background: #050505; color: #f2f2f2; font-family: var(--font-sans); -webkit-font-smoothing: antialiased; }
+::selection { background: #ffffff; color: #050505; }
+@layer components {
+.display { font-family: var(--font-display); font-stretch: 112%; font-weight: 560; letter-spacing: -0.02em; text-transform: uppercase; line-height: 0.92; }
+.label { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--color-dim); }
+.wrap { margin-inline: auto; max-width: 1440px; padding-inline: 20px; }
+@media (min-width: 768px) { .wrap { padding-inline: 40px; } }
+.grid12 { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); column-gap: 20px; }
+.textbtn { display: inline-flex; align-items: center; gap: 14px; height: 44px; padding: 0 18px; border: 1px solid #ffffff66; font-family: var(--font-mono); font-size: 12px; letter-spacing: .14em; text-transform: uppercase; transition: background .3s, color .3s, border-color .3s; }
+.textbtn:hover { background: #f2f2f2; color: #050505; border-color: #f2f2f2; }
+.textbtn.solid { background: #f2f2f2; color: #050505; border-color: #f2f2f2; }
+.textbtn.solid:hover { background: transparent; color: #f2f2f2; }
+.ulink { background: linear-gradient(currentColor, currentColor) 0 100% / 0 1px no-repeat; transition: background-size .4s; }
+.ulink:hover { background-size: 100% 1px; }
 }
-@keyframes beam { from { offset-distance: 0%; } to { offset-distance: 100%; } }
-@keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
-html { scroll-behavior: smooth; scroll-padding-top: 80px; color-scheme: dark; }
-body { background: var(--background); color: var(--foreground); font-family: var(--font-sans); -webkit-font-smoothing: antialiased; font-feature-settings: "cv11", "ss01"; }
-::selection { background: #7eb6ff40; }
-.text-balance { text-wrap: balance; }
 @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } *, *::before, *::after { animation: none !important; transition: none !important; } }
+/* motion: slow fades and line-draw only */
+@keyframes appear { from { opacity: 0; } to { opacity: 1; } }
+@keyframes draw { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
+.appear { animation: appear 1.4s cubic-bezier(.25,.1,.25,1) both; }
+.draw { stroke-dasharray: 1; animation: draw 1.6s ease-in-out both; }
+.fade { opacity: 0; transition: opacity 1.1s cubic-bezier(.25,.1,.25,1) var(--d, 0s); }
+.fade.in { opacity: 1; }
+.fade .hline { transform: scaleX(0); transition: transform 2.4s ease-in-out .2s; }
+.fade.in .hline { transform: scaleX(1); }
+@media (prefers-reduced-motion: reduce) { .fade { opacity: 1; } .fade .hline { transform: none; } .draw { stroke-dasharray: none; } }
