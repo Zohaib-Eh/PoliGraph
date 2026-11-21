@@ -97,7 +97,7 @@ EXPLAIN_TYPES = {
 INVOICE_LIKE = {"invoice", "supplier_invoice", "supplier_invoices", "dealer_invoice", "hospital_invoice",
                 "carrier_invoice", "freight_invoices", "contract_schedule", "supply_contract", "consulting_contract",
                 "purchase_order", "payment_file", "receipt", "credit_note"}
-SUSPICION_WORDS = re.compile(r"\b(scam|fraud|freeze|mule|launder\w*|crypto)\b", re.I)
+SUSPICION_WORDS = re.compile(r"\b(scam|fraud|freeze|mule|launder\w*|crypto|refus(?:ed|es|ing|al))\b", re.I)
 GENERIC_TOKENS = {"ltd", "llp", "plc", "limited", "the", "and", "of", "client", "account", "co", "company", "group",
                   "holdings", "estate", "payment", "transfer", "from", "to", "for", "bank", "refund", "booking",
                   "inv", "ref", "sal", "srl", "fze", "bv", "gmbh", "trading", "services", "solicitors", "card",
@@ -1157,15 +1157,17 @@ def s_corridor(cs):
     ids = [t for a in tm06 for t in a["transaction_ids"]]
     country = (tm06[0].get("measured") or {}).get("countries") or ""
     # staff note: client cannot explain the routing
-    for d in cs.of_type("staff_note"):
+    for d in cs.of_type("staff_note", "note") + [x for x in cs.docs if x.type == "contact_note"]:
         if re.search(r"unable|unwilling|evasive|declin|refus|could ?n[o']t|cannot|can't|failed to|not (able|provide|explain)|"
+                     r"would rather not|would ?n[o']t|won't|did ?n[o']t see why|"
                      r"no (clear |plausible |credible )?(reason|justification|explanation|rationale)", d.body, re.I) and \
                 re.search(r"rout|lebanon|iraq|iran|syria|countr|abroad", d.body, re.I):
             fid = cs.fact("client_cannot_explain_corridor", [d.id], country=country)
             invs = [x for x in cs.of_type("supplier_invoices", "supplier_invoice", "invoice")]
-            reason = ("%s moved to or from %s, a higher-risk country the client did not declare. Staff note %s records that "
+            reason = ("%s moved to or from %s, a higher-risk country the client did not declare. %s %s records that "
                       "the director could not explain why the payments go to %s%s. The payments are unexplained." % (
-                          fmt(sum(cs.t(t)["amount_gbp"] for t in ids if cs.t(t))), country, d.id, country,
+                          fmt(sum(cs.t(t)["amount_gbp"] for t in ids if cs.t(t))), country,
+                          "Staff note" if d.type == "staff_note" else "Note", d.id, country,
                           (", and invoices %s describe services that do not fit a %s business" % (
                               ", ".join(x.id for x in invs), (cs.cust.get("business_activity") or "").lower())) if invs else ""))
             return Finding("ESC_HIGH_RISK_CORRIDOR", "S9_corridor_unexplained", reason,
@@ -1256,9 +1258,143 @@ def s_payment_file_mule(cs):
     return None
 
 
+PLATE_RE = re.compile(r"\b([A-Z]{2}\d{2} ?[A-Z]{3})\b")
+SALE_TYPES = ("vehicle_sale_receipt", "sale_receipt")
+
+
+def s_asset_after_sale(cs):
+    """A sale receipt explains money received for an asset; a later document still showing the customer holding or
+    insuring the same asset (same registration) contradicts the sale."""
+    for d in cs.of_type(*SALE_TYPES):
+        if not d.dated or not cs.cname:
+            continue
+        for plate in sorted(set(PLATE_RE.findall(d.body))):
+            key = plate.replace(" ", "")
+            for o in cs.sig_docs:
+                if o.id == d.id or o.type in SALE_TYPES or not o.dated or o.dated <= d.dated:
+                    continue
+                if key not in o.body.replace(" ", "") or norm(cs.cname) not in o.ntext:
+                    continue
+                fid = cs.fact("asset_still_held_after_claimed_sale", [d.id, o.id], asset=plate, sold=str(d.dated),
+                              later=str(o.dated))
+                cs.edge(o.id, d.id, "contradicts")
+                tx = [t for t in cs.alerted if cs.t(t)][:6]
+                reason = ("%s (%s) says vehicle %s was sold, which is the explanation given for the funds. But %s (%s), "
+                          "dated %s, after the sale, still shows %s with the same vehicle. The documents contradict each "
+                          "other, so the source of the funds is unexplained." % (
+                              d.id, dtxt(d.dated), plate, o.id, o.type.replace("_", " "), dtxt(o.dated), cs.cname))
+                return Finding("ESC_UNEXPLAINED_FUNDS", "S12_contradicting_document", reason,
+                               [d.id, o.id] + [a["alert_id"] for a in cs.alerts] + tx, [fid])
+    return None
+
+
+def sale_seller(d):
+    s = d.fields.get("seller") or ""
+    if not s:
+        m = re.search(r"\bsold by ([A-Z][\w'-]+(?: [A-Z][\w'-]+){1,3})", d.body)
+        s = m.group(1) if m else ""
+    return re.split(r",", s)[0].strip()
+
+
+def s_doc_other_name(cs):
+    """A sale receipt offered for money the customer received must show the customer as the seller; one in another
+    person's name does not explain the customer's funds."""
+    if not cs.cname or cs.cust.get("kind") == "business":
+        return None
+    for d in cs.of_type(*SALE_TYPES):
+        seller = sale_seller(d)
+        if not seller or same_name(seller, cs.cname) or surname(seller) == surname(cs.cname):
+            continue
+        hits = [t for t in in_txns(cs) if t["transaction_id"] in cs.alerted and amount_in(t, d)]
+        if not hits:
+            continue
+        fid = cs.fact("supporting_document_in_another_name", [d.id] + [t["transaction_id"] for t in hits],
+                      named=seller, customer=cs.cname)
+        cs.edge(d.id, hits[0]["transaction_id"], "contradicts")
+        reason = ("%s is offered to explain the %s received (%s), but it records a sale by %s, not by the customer %s. "
+                  "A receipt in another person's name does not show where the customer's money came from, so the funds "
+                  "are unexplained." % (d.id, fmt(hits[0]["amount_gbp"]), hits[0]["transaction_id"], seller, cs.cname))
+        return Finding("ESC_UNEXPLAINED_FUNDS", "S13_document_in_another_name", reason,
+                       [d.id] + [t["transaction_id"] for t in hits] + [a["alert_id"] for a in cs.alerts], [fid])
+    return None
+
+
+def doc_company(d):
+    c = reg_company(d)
+    if c:
+        return c
+    m = re.search(r" for (.+)$", d.heading or d.title)
+    return m.group(1).strip() if m else None
+
+
+def s_group_contradicted(cs):
+    """A group-structure chart claiming a counterparty shares the customer's owner is contradicted when the
+    counterparty's own register lists different officers and controllers."""
+    me = norm(cs.cname)
+    win = cs.window_txns()
+    for d in cs.of_type("group_structure"):
+        edges = [(r.get("company"), r.get("owner") or r.get("owned by")) for tb in d.tables for r in tb]
+        edges = [(c, o) for c, o in edges if c and o]
+        if me not in set(norm(c) for c, _ in edges) | set(norm(o) for _, o in edges):
+            continue
+        for comp, own in edges:
+            if norm(comp) == me:
+                continue
+            tx = [t for t in win if norm(t.get("counterparty_name")) == norm(comp)]
+            if not tx:
+                continue
+            for g in cs.of_type("company_register_extract", "significant_control_register"):
+                if norm(doc_company(g) or "") != norm(comp):
+                    continue
+                names = sorted(set(n for tb in g.tables for r in tb for n in [rget(r, "person", "officer", "name")] if n))
+                if not names or any(same_name(n, own) or norm(own) in norm(n) or norm(n) in norm(own) for n in names):
+                    continue
+                fid = cs.fact("group_claim_contradicted_by_register", [d.id, g.id], company=comp, claimed_owner=own,
+                              register_names=names)
+                cs.edge(g.id, d.id, "contradicts")
+                reason = ("%s claims %s is owned by %s, in the customer's group, but register %s lists only %s as its "
+                          "officers and controllers. The group link is not supported, so %s from %s is unexplained "
+                          "third-party funding." % (d.id, comp, own, g.id, ", ".join(names), fmt(sum(t["amount_gbp"] for t in tx)),
+                                                    comp))
+                return Finding("ESC_THIRD_PARTY_FUNDING", "S14_group_claim_contradicted", reason,
+                               [d.id, g.id] + [t["transaction_id"] for t in tx[:6]] + [a["alert_id"] for a in cs.alerts], [fid])
+    return None
+
+
+SOURCE_DOC_TYPES = ("gift_letter", "completion_statement")
+
+
+def s_source_doc_contradicts(cs):
+    """A gift letter or completion statement explains money from a named source. When the alerted credit comes from a
+    payer the document does not name and is larger than any amount the document gives, the document contradicts the
+    payment rather than explaining it."""
+    docs = cs.of_type(*SOURCE_DOC_TYPES)
+    if not docs:
+        return None
+    ins = [t for t in in_txns(cs) if t["transaction_id"] in cs.alerted and t["amount_gbp"] >= 1000
+           and not cs.is_self(t.get("counterparty_name")) and not (t.get("channel") or "").startswith("cash")]
+    for t in sorted(ins, key=lambda x: (-x["amount_gbp"], x["transaction_id"])):
+        if any(amount_in(t, d) or party_match(t, d) for d in docs):
+            return None
+        d = docs[0]
+        if not d.amounts or t["amount_gbp"] <= max(d.amounts):
+            continue
+        fid = cs.fact("source_document_contradicts_payment", [d.id, t["transaction_id"]], payer=t.get("counterparty_name"),
+                      documented=max(d.amounts), received=t["amount_gbp"])
+        cs.edge(d.id, t["transaction_id"], "contradicts")
+        reason = ("%s (%s) documents %s, but the alerted credit %s is %s from %s, a payer the document does not name. "
+                  "The document contradicts the payment instead of explaining it, leaving %s and the payer unexplained." % (
+                      d.id, d.type.replace("_", " "), fmt(max(d.amounts)), t["transaction_id"], fmt(t["amount_gbp"]),
+                      t.get("counterparty_name"), fmt(round(t["amount_gbp"] - max(d.amounts), 2))))
+        return Finding("ESC_THIRD_PARTY_FUNDING", "S15_source_document_contradicts", reason,
+                       [d.id, t["transaction_id"]] + [a["alert_id"] for a in cs.alerts], [fid])
+    return None
+
+
 SUSPICION_RULES = [s_fraud_reports, s_mule_chat, s_structuring_note, s_dissolved_payer, s_pass_through,
                    s_third_party_investing, s_payment_file_mule, s_shared_device, s_inconsistent_story, s_corridor,
-                   s_invoice_mismatch]
+                   s_invoice_mismatch, s_asset_after_sale, s_doc_other_name, s_group_contradicted,
+                   s_source_doc_contradicts]
 
 
 # ----------------------------------------------------------------------------
@@ -1300,6 +1436,38 @@ def dob_near(text, name):
     return None
 
 
+PROXY_DAYS = 30
+RELATIVE_RE = r"\b(?:son|daughter|wife|husband|spouse|partner|brother|sister|father|mother|relative|family|nephew|niece|cousin)\b"
+
+
+def proxy_successor(rows, lname, pay):
+    """A listed person whose control/office ended shortly before the payment and passed to a relative (same surname
+    or described as family) at about the same time is still treated as controlling the company (proxy handover)."""
+    if not pay:
+        return None
+    for d, r in rows:
+        end = pdate(rget(r, "ceased", "resigned"))
+        if not end or not (0 <= (pay - end).days <= PROXY_DAYS):
+            continue
+        for tb in d.tables:
+            for rr in tb:
+                n = rget(rr, "person", "officer", "name")
+                if not n or same_name(n, lname):
+                    continue
+                start = pdate(rget(rr, "notified", "appointed"))
+                if not start or abs((start - end).days) > 7:
+                    continue
+                why = ""
+                if surname(n) and surname(n) == surname(lname):
+                    why = "same surname"
+                elif re.search(re.escape(n) + r"[^.\n]{0,60}" + RELATIVE_RE, d.body, re.I) or \
+                        re.search(RELATIVE_RE + r"[^.\n]{0,40}" + re.escape(n), d.body, re.I):
+                    why = "described as a relative"
+                if why:
+                    return d, n, end, start, why
+    return None
+
+
 def resolve_tm22(cs, a):
     m = a.get("measured") or {}
     L = cs.list_entries.get(m.get("list_entry"))
@@ -1313,7 +1481,7 @@ def resolve_tm22(cs, a):
     cs.edge(a["alert_id"], L["entry_id"], "matches")
     res = {"status": "unsettled", "basis": basis, "entry": L["entry_id"], "lname": lname, "docs": [], "note": "",
            "pay": pay, "txn": t}
-    if "officer" in basis:
+    if "officer" in basis or "significant control" in basis:
         psc_rows, reg_rows = [], []
         for d in cs.of_type("significant_control_register"):
             for tb in d.tables:
@@ -1325,6 +1493,8 @@ def resolve_tm22(cs, a):
                 for r in tb:
                     if norm(rget(r, "officer", "name")) == norm(lname):
                         reg_rows.append((d, r))
+                    elif not rget(r, "officer") and norm(rget(r, "person", "name")) == norm(lname):
+                        psc_rows.append((d, r))  # PSC table inside a register extract
         # A different birth month/year on the register disproves identity
         for d, r in reg_rows + psc_rows:
             born = rget(r, "born", "date of birth", "dob")
@@ -1359,6 +1529,18 @@ def resolve_tm22(cs, a):
         if psc_rows or reg_rows:
             ended = all(pdate(rget(r, "ceased", "resigned")) and pay and
                         pdate(rget(r, "ceased", "resigned")) < pay for _, r in psc_rows + reg_rows)
+            proxy = proxy_successor(psc_rows + reg_rows, lname, pay) if ended else None
+            if proxy:
+                d, succ, end, start, why = proxy
+                fid = cs.fact("listed_person_handed_control_to_relative_before_payment", [d.id, L["entry_id"]] + tids,
+                              successor=succ, ceased=str(end), successor_from=str(start), payment=str(pay))
+                cs.edge(d.id, L["entry_id"], "supports")
+                res.update(status="confirmed", docs=sorted(set(x.id for x, _ in psc_rows + reg_rows)), fact=fid,
+                           note=("%s shows %s's control ended on %s, only %s before the %s payment on %s, and passed "
+                                 "to %s (%s), so control stayed with the listed party's family" % (
+                                     d.id, lname, dtxt(end), "1 day" if (pay - end).days == 1 else "%d days" % (pay - end).days, fmt(t["amount_gbp"]) if t else "",
+                                     dtxt(pay), succ, why)))
+                return res
             if ended and psc_rows:
                 d = psc_rows[0][0]
                 fid = cs.fact("listed_person_left_before_payment", [d.id, L["entry_id"]])
@@ -1975,6 +2157,17 @@ def decide(cs):
     if not codes:
         codes.add("WITHIN_PROFILE")
     code = [c for c in CLOSE_PRIORITY if c in codes][0]
+    tm07 = cs.alerts_of("TM07")
+    if code == "WITHIN_PROFILE" and tm07 and not cs.of_type("reverification_record"):
+        a = tm07[0]
+        m = a.get("measured") or {}
+        cs.fire("R_DORMANT_SOURCE_UNEVIDENCED", "RFI_SOURCE_OF_FUNDS", [])
+        return ("RFI_SOURCE_OF_FUNDS", "Alert %s: the account was dormant for %s days and %s has since moved through it. "
+                "Nothing on file evidences the source of the reactivation funds and no re-verification of the customer "
+                "is recorded, so the profile alone cannot close it. Ask the customer for evidence of the source, such as "
+                "a payslip, contract or a statement for the paying account." % (
+                    a["alert_id"], m.get("dormant_days", "many"), fmt(m.get("moved_gbp") or 0)),
+                [a["alert_id"]] + list(a["transaction_ids"])[:6], trace)
     sents = [CLOSE_LEAD[code]]
     ev = []
     if code == "LIST_MATCH_DIFFERENT_PARTY":
