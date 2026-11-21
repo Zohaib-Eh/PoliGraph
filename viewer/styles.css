@@ -211,3 +211,9 @@ mark.con{background:var(--esc-bg);color:var(--text);border-bottom:2px solid var(
 .hide{display:none!important}
 @media (max-width:1100px){.kpis{grid-template-columns:repeat(3,1fr)}.ladder,.pipe{grid-template-columns:1fr 1fr}.g-main,.g2{grid-template-columns:1fr}}
 .btn:disabled{opacity:.45;cursor:not-allowed}
+/* institution switcher + per-institution table (All view) */
+.ph-r{display:flex;gap:12px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+.inst-seg button{padding:6px 12px;font-size:13px;white-space:nowrap}
+.mix.sm{height:8px;margin:0}
+.inst-tbl tr.row{cursor:pointer}
+.tbl td.cid{white-space:nowrap}

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Build viewer/data/<inst>.js from the engine's outputs, traces and the evidence markdown.
 
-usage: python3 viewer/build_data.py [--detail N] [--runs 5]
-  - summary rows for every case (queue, counters)
-  - full detail (graph, recon, docs, timeline) for N cases per institution (stratified by
-    reason code, always including the pinned demo cases)
+usage: python3 viewer/build_data.py [--detail N] [--runs 5] [--shard 100]
+  - summary rows for every case (queue, counters) in data/<inst>.js
+  - full detail (graph, recon, docs, timeline) for N cases per institution (default: all of them; stratified by
+    reason code when N is smaller, always including the pinned demo cases), written as lazy-loaded shards
+    data/detail/<inst>-<k>.js of --shard cases each, so the viewer only fetches the cases you open
   - determinism fingerprint: re-runs system/run --runs times into a temp dir and hashes the outputs
 """
 import hashlib, json, os, re, subprocess, sys, tempfile
@@ -456,7 +457,7 @@ def engine_js():
 
 
 def main():
-    detail_n, runs = arg("--detail", 200), arg("--runs", 5)
+    detail_n, runs, shard_n = arg("--detail", 1000), arg("--runs", 5), arg("--shard", 100)
     ontology_js()
     engine_js()
     bp = os.path.join(ROOT, "viewer", "data", "briefs.json")
@@ -470,13 +471,36 @@ def main():
         for cid, d in data["detail"].items():
             if cid in briefs:
                 d["brief"] = briefs[cid]
+        # detail goes to lazy shards (file order), the rows file only says which shard holds each case
+        ddir = os.path.join(ROOT, "viewer", "data", "detail")
+        os.makedirs(ddir, exist_ok=True)
+        for f in os.listdir(ddir):
+            if f.startswith(inst + "-") and f.endswith(".js"):
+                os.unlink(os.path.join(ddir, f))
+        ids = [r["id"] for r in data["rows"] if r["id"] in data["detail"]]
+        shard_of = {}
+        for k in range(0, len(ids), shard_n):
+            chunk = ids[k:k + shard_n]
+            with open(os.path.join(ddir, "%s-%d.js" % (inst, k // shard_n)), "w", encoding="utf-8") as fh:
+                fh.write("window.PROOF_DETAIL = window.PROOF_DETAIL || {};\n(function (d) { var t = "
+                         "window.PROOF_DETAIL[%s] = window.PROOF_DETAIL[%s] || {}; for (var k in d) t[k] = d[k]; })("
+                         % (json.dumps(inst), json.dumps(inst)))
+                json.dump({c: data["detail"][c] for c in chunk}, fh, ensure_ascii=False, separators=(",", ":"))
+                fh.write(");\n")
+            for c in chunk:
+                shard_of[c] = k // shard_n
+        for r in data["rows"]:
+            if r["id"] in shard_of:
+                r["shard"] = shard_of[r["id"]]
+        nd = len(data["detail"])
+        data = dict(data, detail={}, lazy=True)
         p = os.path.join(ROOT, "viewer", "data", inst + ".js")
         with open(p, "w", encoding="utf-8") as fh:
             fh.write("window.PROOF_DATA = window.PROOF_DATA || {};\nwindow.PROOF_DATA[%s] = " % json.dumps(inst))
             json.dump(data, fh, ensure_ascii=False, separators=(",", ":"))
             fh.write(";\n")
         index.append(inst)
-        print(inst, "rows", len(data["rows"]), "detail", len(data["detail"]), "demos", data["demos"],
+        print(inst, "rows", len(data["rows"]), "detail", nd, "shards", len(set(shard_of.values())), "demos", data["demos"],
               "runs", [r["verdict_code_hash"] for r in data["runs"]], "%.1f MB" % (os.path.getsize(p) / 1e6))
     with open(os.path.join(ROOT, "viewer", "data", "index.js"), "w") as fh:
         fh.write("window.PROOF_INSTS = %s;\n" % json.dumps(index))

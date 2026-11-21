@@ -44,7 +44,11 @@ def load_policy_overrides(path, inst):
      "overrides": {"<key>": <number or null>, ...}, "version": n, "approved_by": "...", "reason": "..."}"""
     with open(path, encoding="utf-8") as fh:
         doc = json.load(fh)
+    if not isinstance(doc, dict):
+        raise ValueError("policy file must be a JSON object")
     ov = doc.get("overrides", doc)
+    if not isinstance(ov, dict):
+        raise ValueError("policy 'overrides' must be a JSON object")
     target = doc.get("institution")
     if target and target != inst:
         return {}
@@ -52,8 +56,8 @@ def load_policy_overrides(path, inst):
     for k, v in sorted(ov.items()):
         if k not in POLICY_KEYS:
             raise ValueError("unknown policy key %r" % k)
-        if v is not None and not isinstance(v, (int, float)):
-            raise ValueError("policy key %r must be a number or null" % k)
+        if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or v < 0):
+            raise ValueError("policy key %r must be a non-negative number or null" % k)
         POLICY.setdefault(inst, dict(POLICY["bank"]))[k] = None if v is None else float(v)
         applied[k] = v
     return applied
@@ -105,7 +109,9 @@ MONTHS = {m: i for i, m in enumerate(["january", "february", "march", "april", "
 # Parsing helpers
 # ----------------------------------------------------------------------------
 # Pound amounts: "£1,234.56", "GBP 1234.56", "1,234.56 GBP", "1,234 pounds".
-MONEY_RE = re.compile(r"(?:£|\bGBP)\s?(\d[\d,]*(?:\.\d{1,2})?)|\b(\d[\d,]*(?:\.\d{1,2})?)\s?(?:GBP|pounds?)\b", re.I)
+# Numbers must use proper thousands grouping ("1,234,567.89" or "1234567.89"); "1,23,456" or "12,34" is not read.
+_NUM = r"(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)(?!\d|[,.]\d)"
+MONEY_RE = re.compile(r"(?:£|\bGBP)\s?" + _NUM + r"|(?<![\d,.])\b" + _NUM + r"\s?(?:GBP|pounds?)\b", re.I)
 CUR = r"(?:£|\bGBP\s?)"  # currency marker used inside threshold-talk patterns
 # One shared date grammar: "12 August 2026", "12th Aug 2026", "August 12, 2026", "2026-08-12", "12/08/2026" (UK d/m).
 _MON = (r"(?:January|February|March|April|May|June|July|August|September|October|November|December|"
@@ -148,8 +154,11 @@ def match_date(m):
     g = m.groupdict()
     for i in "1234":
         if g.get("y" + i):
+            d, mo = g["d" + i], g["m" + i]
+            if i == "4" and int(mo) > 12 and int(d) <= 12:
+                d, mo = mo, d  # US month-first, only when unambiguous
             try:
-                return date(int(g["y" + i]), month_num(g["m" + i]), int(g["d" + i]))
+                return date(int(g["y" + i]), month_num(mo), int(d))
             except (TypeError, ValueError):
                 return None
     return None
@@ -194,6 +203,32 @@ def norm(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
+NAME_TITLES = {"mr", "mrs", "ms", "miss", "mx", "dr", "sir", "dame", "prof", "lord", "lady"}
+LEGAL_FORMS = {"ltd", "plc", "llp", "inc", "llc", "lp"}
+
+
+def name_key(s):
+    """Order-free key for a person or company name: drops titles (Mr/Mrs/Ms/Miss/Dr), single-letter initials,
+    '(UK)' and legal forms, and reads 'Surname, Forename' as 'Forename Surname'. '' when fewer than two words remain,
+    so a lone surname never matches on its own."""
+    s = re.sub(r"\((?:uk|u\.k\.|gb)\)", " ", str(s or ""), flags=re.I)
+    m = re.match(r"^\s*([^,]+),\s*([^,]+?)\s*$", s)
+    if m and len(m.group(1).split()) == 1:
+        s = m.group(2) + " " + m.group(1)
+    toks = [t for t in norm(s).split() if t not in NAME_TITLES and t not in LEGAL_FORMS and len(t) > 1]
+    return " ".join(sorted(toks)) if len(toks) >= 2 else ""
+
+
+def same_name(a, b):
+    """Exact normalised equality, or equal name keys (see name_key)."""
+    if not a or not b:
+        return False
+    if norm(a) == norm(b):
+        return True
+    ka = name_key(a)
+    return bool(ka) and ka == name_key(b)
+
+
 def tokens(s):
     return [t for t in norm(s).split() if len(t) >= 4 and t not in GENERIC_TOKENS and not t.isdigit()]
 
@@ -232,10 +267,34 @@ def parse_fields(text):
     return f
 
 
+_KV_ROW = re.compile(r"^(?:[-*+\u2022]\s+|\d+[.)]\s+)?((?:[A-Za-z][\w /()#.-]{0,30}:\s*[^;]*;\s*)+[A-Za-z][\w /()#.-]{0,30}:\s*[^;]*?)\s*;?$")
+
+
+def kv_row(line):
+    """'- Date: 3 May 2026; Payer: Ann Lee; Amount: £500.00' -> {'date': ..., 'payer': ..., 'amount': ...}."""
+    m = _KV_ROW.match(line)
+    if not m or line.startswith("**"):
+        return None
+    row = {}
+    for part in m.group(1).split(";"):
+        k, _, v = part.partition(":")
+        if k.strip():
+            row.setdefault(k.strip().lower(), v.strip())
+    return row if len(row) >= 2 else None
+
+
 def parse_tables(text):
     tables, cur, header = [], None, None
+    kv = []
     for line in text.split("\n"):
         line = line.strip()
+        r = kv_row(line) if ";" in line and not line.startswith("|") else None
+        if r:
+            kv.append(r)
+            continue
+        if kv:
+            tables.append(kv)
+            kv = []
         if line.startswith("|") and line.endswith("|"):
             cells = [c.strip() for c in line.strip("|").split("|")]
             if header is None:
@@ -251,6 +310,8 @@ def parse_tables(text):
             header, cur = None, None
     if header is not None:
         tables.append(cur)
+    if kv:
+        tables.append(kv)
     return tables
 
 
@@ -329,6 +390,8 @@ def _date_sub(kind):
             y, mo, d = g
         elif kind == "dmy":
             d, mo, y = g
+            if mo.isdigit() and d.isdigit() and int(mo) > 12 and int(d) <= 12:
+                d, mo = mo, d  # US month-first, only when unambiguous (second number > 12)
         elif kind == "mdy":
             mo, d, y = g
         elif kind == "dMy":
@@ -359,9 +422,33 @@ def _money_sub(m):
 
 
 _MONEY_FIXES = [
-    re.compile(r"(?<![\w£])(\d[\d,]*(?:\.\d{1,2})?)\s?(?:GBP|pounds sterling|pounds|pound|sterling)\b", re.I),
-    re.compile(r"\b(?:GBP|STG|sterling)\s?£?\s?(\d[\d,]*(?:\.\d{1,2})?)(?![\d])", re.I),
-    re.compile(r"£\s?(\d[\d,]*(?:\.\d{1,2})?)(?![\d])"),
+    re.compile(r"(?<![\w£.,])" + _NUM + r"\s?(?:GBP|pounds sterling|pounds|pound|sterling)\b", re.I),
+    re.compile(r"\b(?:GBP|STG|sterling)\s?£?\s?" + _NUM, re.I),
+    re.compile(r"£\s?" + _NUM),
+]
+
+
+def _eu_sub(m):
+    """'12 000,00 GBP' / '£12.000,50' (European grouping, decimal comma) -> '£12,000.00'."""
+    ip = re.sub(r"[ .\u00a0\u202f]", "", m.group(1))
+    return "£{:,}".format(int(ip)) + ("." + m.group(2) if m.group(2) else "")
+
+
+_MULT = {"k": 1000, "thousand": 1000, "m": 1000000, "mn": 1000000, "million": 1000000}
+
+
+def _mult_sub(m):
+    """'£12.5k' / '£1.2m' / '£3 million' -> '£12,500' / '£1,200,000' / '£3,000,000'."""
+    v = round(float(m.group(1)) * _MULT[m.group(2).lower()], 2)
+    return "£{:,}".format(int(v)) if v == int(v) else "£{:,.2f}".format(v)
+
+
+_MONEY_PRE = [  # run before _MONEY_FIXES; each needs a currency marker so plain numbers are untouched
+    (re.compile(r"(?<![\w,.])(\d{1,3}(?:[ .\u00a0\u202f]\d{3})*),(\d{2})(?![\d,])\s?(?:GBP|pounds?)\b", re.I), _eu_sub),
+    (re.compile(r"£\s?(\d{1,3}(?:[ .\u00a0\u202f]\d{3})*),(\d{2})(?![\d,])"), _eu_sub),
+    (re.compile(r"(?<![\w,.])(\d{1,3}(?:[ \u00a0\u202f]\d{3})+)()(?![\d,])\s?(?:GBP|pounds?)\b", re.I), _eu_sub),
+    (re.compile(r"£\s?(\d{1,3}(?:[ \u00a0\u202f]\d{3})+)()(?![\d,.])"), _eu_sub),
+    (re.compile(r"(?:£|\bGBP\s?)(\d+(?:\.\d+)?)\s?(k|m|mn|thousand|million)\b", re.I), _mult_sub),
 ]
 _BLOCK_START = re.compile(r"^\s*(?:\||#|\*\*|[-*+] |\d+[.)] |>)")
 
@@ -419,6 +506,8 @@ def normalise(text):
             out.append(ln)
     text = "\n".join(out)
     low = text.lower()
+    for rx, fn in _MONEY_PRE:
+        text = rx.sub(fn, text)
     for i, rx in enumerate(_MONEY_FIXES):
         if i < 2 and not any(h in low for h in _MONEY_HINTS):
             continue
@@ -463,23 +552,85 @@ class Doc(object):
         self.tables = parse_tables(text)
         self.amounts = money(self.body)
         self.ntext = norm(self.title + " " + self.body)
+        h = re.search(r"^# (.*)$", text, re.M)
+        self.heading = h.group(1) if h else ""
+
+
+PAYEE_LABELS = ("pay to", "payee", "beneficiary", "supplier", "seller", "issued by", "billed by", "account name",
+                "vendor", "dealer", "merchant")
+
+
+def payee_text(d):
+    """Who the document itself says is to be paid: the stated payee/supplier fields, else the document's own
+    heading and body. The index title in evidence.jsonl is not used (it is a summary, not the document)."""
+    vals = [v for k, v in d.fields.items() if k in PAYEE_LABELS and v]
+    if vals:
+        return norm(" ".join(vals))
+    return norm(d.heading + " " + d.body)
+
+
+def payee_match(t, d):
+    """Does the document name transaction t's payee (counterparty-name tokens in the payee text, or its account)?"""
+    if (t.get("channel") or "").startswith("cash"):
+        return True
+    pt = payee_text(d)
+    if any(re.search(r"\b%s\b" % re.escape(x), pt) for x in tokens(t.get("counterparty_name") or "")):
+        return True
+    # A matching account number only stands in for the payee when the document names no payee at all;
+    # an invoice naming a different supplier than the one paid does not match on payee.
+    if any(tokens(re.sub(r"account (?:ending|number|no)\b.*", "", v)) for k, v in d.fields.items() if k in PAYEE_LABELS):
+        return False
+    k = acct_key(t.get("counterparty_account"))
+    return bool(k and re.search(r"\b\d*%s\b" % k, d.body))
 
 
 # ----------------------------------------------------------------------------
 # Loading (only from the given institution folder)
 # ----------------------------------------------------------------------------
+SKIPPED_LINES = {}  # file name -> malformed lines skipped (reported on stderr)
+
+
 def read_jsonl(path):
+    """Read a jsonl file; malformed or non-object lines are skipped and counted, never fatal."""
     out = []
     if not os.path.exists(path):
         return out
-    with open(path, encoding="utf-8") as fh:
+    with open(path, encoding="utf-8", errors="replace") as fh:
         for line in fh:
             line = line.strip()
             if line:
-                rec = json.loads(line)
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    rec = None
+                if not isinstance(rec, dict):
+                    SKIPPED_LINES[os.path.basename(path)] = SKIPPED_LINES.get(os.path.basename(path), 0) + 1
+                    continue
                 special = not line.replace("£", "").replace("\u2019", "").isascii() or "\\u" in line or "\\t" in line or "  " in line
                 out.append(normalise_record(rec) if special and any(c in line for c in _RAW_SPECIALS) else rec)
     return out
+
+
+def keyed(rows, key):
+    """Index records by their id, skipping records without a usable id."""
+    return {r[key]: r for r in rows if isinstance(r.get(key), str)}
+
+
+# Institution type from the first heading of POLICY.md, used only when cases.jsonl and the folder name do not say.
+POLICY_HEADINGS = [("payments_fx", r"payments?\b.*\b(fx|foreign exchange)"), ("emoney", r"e-?money|electronic money"),
+                   ("investment", r"investment|wealth|stockbrok|platform"), ("bank", r"\bbank")]
+
+
+def policy_institution(folder):
+    try:
+        with open(os.path.join(folder, "POLICY.md"), encoding="utf-8", errors="replace") as fh:
+            head = " ".join(fh.read(600).splitlines()[:3]).lower()
+    except OSError:
+        return None
+    for inst, rx in POLICY_HEADINGS:
+        if re.search(rx, head):
+            return inst
+    return None
 
 
 class World(object):
@@ -494,26 +645,53 @@ class World(object):
             for k in POLICY:
                 if k in folder.lower():
                     self.inst = k
-        self.alerts = {a["alert_id"]: a for a in read_jsonl(os.path.join(folder, "alerts.jsonl"))}
-        self.customers = {c["customer_id"]: c for c in read_jsonl(os.path.join(folder, "customers.jsonl"))}
+                    break
+            else:
+                self.inst = policy_institution(folder) or self.inst
+        self.alerts = keyed(read_jsonl(os.path.join(folder, "alerts.jsonl")), "alert_id")
+        self.customers = keyed(read_jsonl(os.path.join(folder, "customers.jsonl")), "customer_id")
         self.txns, self.txns_by_cust = {}, {}
+        self.bad_txn_customers = set()  # customers with an unreadable transaction record: their cases never CLOSE
         for t in read_jsonl(os.path.join(folder, "transactions.jsonl")):
+            if not isinstance(t.get("transaction_id"), str) or not isinstance(t.get("customer_id"), str):
+                continue
+            for k in ("amount_gbp", "amount"):
+                if isinstance(t.get(k), str):
+                    try:
+                        t[k] = float(t[k].replace(",", "").replace("£", "").strip())
+                    except ValueError:
+                        pass
+            a = t.get("amount_gbp")
+            if t.get("direction") not in ("in", "out") or isinstance(a, bool) or not isinstance(a, (int, float)) \
+                    or a != a or abs(a) == float("inf") or (t.get("amount") is not None and
+                                                            not isinstance(t.get("amount"), (int, float))):
+                self.bad_txn_customers.add(t["customer_id"])
+                SKIPPED_LINES["transactions.jsonl (unusable records)"] = \
+                    SKIPPED_LINES.get("transactions.jsonl (unusable records)", 0) + 1
+                continue
+            if not isinstance(t.get("booked_at"), str) or not pdate(t["booked_at"][:10]):
+                t["booked_at"] = None
             self.txns[t["transaction_id"]] = t
             self.txns_by_cust.setdefault(t["customer_id"], []).append(t)
         for v in self.txns_by_cust.values():
-            v.sort(key=lambda t: (t.get("booked_at") or "", t["transaction_id"]))
+            v.sort(key=lambda t: (str(t.get("booked_at") or ""), t["transaction_id"]))
         self.docs_meta = {}
         for e in read_jsonl(os.path.join(folder, "evidence.jsonl")):
-            self.docs_meta.setdefault(e["customer_id"], []).append(e)
+            if isinstance(e.get("doc_id"), str) and isinstance(e.get("customer_id"), str):
+                self.docs_meta.setdefault(e["customer_id"], []).append(e)
         self.reviews = {}
         for r in read_jsonl(os.path.join(folder, "previous_reviews.jsonl")):
-            self.reviews.setdefault(r["customer_id"], []).append(r)
-        self.listed = {r["entry_id"]: r for r in read_jsonl(os.path.join(folder, "internal_list.jsonl"))}
+            if isinstance(r.get("review_id"), str) and isinstance(r.get("customer_id"), str):
+                self.reviews.setdefault(r["customer_id"], []).append(r)
+        self.listed = keyed(read_jsonl(os.path.join(folder, "internal_list.jsonl")), "entry_id")
 
     def docs_for(self, cid):
         out = []
         for m in sorted(self.docs_meta.get(cid, []), key=lambda e: e["doc_id"]):
-            p = os.path.join(self.folder, m.get("file") or ("evidence/%s.md" % m["doc_id"]))
+            p = os.path.join(self.folder, str(m.get("file") or ("evidence/%s.md" % m["doc_id"])))
+            root = os.path.realpath(self.folder)
+            if not os.path.realpath(p).startswith(root + os.sep):  # never read outside the institution folder
+                p = os.path.join(self.folder, "evidence", "%s.md" % re.sub(r"[^\w.-]", "_", str(m["doc_id"])))
             try:
                 with open(p, encoding="utf-8") as fh:
                     txt = fh.read()
@@ -542,7 +720,7 @@ class Case(object):
         self.tx = {t["transaction_id"]: t for t in self.all_txns}
         self.alerted = []
         for a in self.alerts:
-            for t in a.get("transaction_ids", []):
+            for t in (a.get("transaction_ids") if isinstance(a.get("transaction_ids"), list) else []):
                 if t in self.tx and t not in self.alerted:
                     self.alerted.append(t)
         self.held = case.get("held_payment_id")
@@ -561,6 +739,8 @@ class Case(object):
                 self.valid_ids.add(le)
         # proof trace
         self.facts, self.firings, self.edges = [], [], []
+        self.payee_gaps = []
+        self.unmatched_fraud = []  # fraud reports on file that could not be tied to a transaction  # (txn, doc) pairs where the amount matched but the document does not name the payee
 
     # --- trace helpers -----------------------------------------------------
     def fact(self, kind, sources, **val):
@@ -602,7 +782,7 @@ class Case(object):
         return out
 
     def is_self(self, name):
-        return bool(name) and norm(name) == norm(self.cname)
+        return bool(name) and same_name(name, self.cname)
 
     def profile_explained(self, t):
         """Activity the declared profile itself explains: salary from the declared employer, card-acquirer
@@ -624,10 +804,11 @@ class Case(object):
 
 
 def party_match(t, d):
-    """Does document d refer to transaction t's counterparty (name/reference tokens or account digits)?"""
+    """Does document d name transaction t's counterparty (counterparty-name tokens or account digits)?
+    The payment reference is not used: a reference word (a patient name, an invoice label) does not show who was paid."""
     if (t.get("channel") or "").startswith("cash"):
         return True
-    toks = tokens((t.get("counterparty_name") or "") + " " + (t.get("reference") or ""))
+    toks = tokens(t.get("counterparty_name") or "")
     if any(re.search(r"\b%s\b" % re.escape(x), d.ntext) for x in toks):
         return True
     k = acct_key(t.get("counterparty_account"))
@@ -636,9 +817,15 @@ def party_match(t, d):
     return False
 
 
+# Invoice / document / payment-file amounts must match the transaction exactly to the penny (both sides are
+# rounded to pence first, so float noise cannot matter). Other matchers (own-account statements, bookings,
+# scam-report amounts) keep the 1p default.
+DOC_AMOUNT_TOL = 0.0
+
+
 def amount_in(t, d, tol=0.01):
     for a in d.amounts:
-        if abs(a - t["amount_gbp"]) <= tol or (t.get("amount") is not None and abs(a - t["amount"]) <= tol
+        if round(abs(a - t["amount_gbp"]), 2) <= tol or (t.get("amount") is not None and round(abs(a - t["amount"]), 2) <= tol
                                                 and (t.get("currency") or "GBP") == "GBP"):
             return True
     return False
@@ -662,19 +849,48 @@ def out_txns(cs, ids=None):
     return [cs.t(i) for i in ids if cs.t(i) and cs.t(i)["direction"] == "out"]
 
 
+FRAUD_SENDER_RX = re.compile(r"(?:our (?:customer|client)|\b(?:customer|client|account holder),?)\s+(.{3,80}?),?\s+"
+                             r"(?:has |had )?(?:sent|paid|transferred|made)\b", re.I)
+
+
+def fraud_report_hits(cs, d):
+    """Inbound window transactions a sending-bank fraud report refers to: by the named sender (name key), by amount
+    and date (within two days), or by amount paid into the customer's account ending NNNN."""
+    m = FRAUD_SENDER_RX.search(d.body)
+    sender = m.group(1).strip() if m else None
+    days = [x for x in (match_date(md) for md in DATE_RE.finditer(d.body)) if x]
+    ends = set(re.findall(r"(?:account|IBAN)\s+(?:number\s+)?ending(?:\s+in)?\s+(\d{4})", d.body, re.I))
+    hits = []
+    for t in cs.window_txns():
+        if t["direction"] != "in":
+            continue
+        how = None
+        if sender and same_name(t.get("counterparty_name"), sender):
+            how = "sender"
+        elif amount_in(t, d):
+            td = pdate(t.get("booked_at"))
+            if td and any(abs((td - x).days) <= 2 for x in days):
+                how = "amount and date"
+            elif ends and acct_key(t.get("account_id")) in ends:
+                how = "amount into the account ending %s" % acct_key(t.get("account_id"))
+        if how:
+            hits.append((t, how))
+    return sender, hits
+
+
 def s_fraud_reports(cs):
     reps = cs.of_type("sending_bank_fraud_report")
     hits, tids, fids = [], [], []
     for d in reps:
-        m = re.search(r"(?:our customer|customer,?)\s+([A-Z][a-z]+(?: [A-Z][a-z'-]+)+)\s+(?:sent|paid|transferred)", d.body)
-        sender = m.group(1) if m else None
-        for t in cs.window_txns():
-            if t["direction"] == "in" and sender and norm(t.get("counterparty_name")) == norm(sender):
-                hits.append(d.id); tids.append(t["transaction_id"])
-                fids.append(cs.fact("scam_report_sender_paid_customer", [d.id, t["transaction_id"]], sender=sender,
-                                    amount=t["amount_gbp"]))
-                cs.edge(d.id, t["transaction_id"], "contradicts")
-                break
+        sender, found = fraud_report_hits(cs, d)
+        if not found:
+            cs.unmatched_fraud.append(d.id)
+            continue
+        t, how = found[0]
+        hits.append(d.id); tids.append(t["transaction_id"])
+        fids.append(cs.fact("scam_report_sender_paid_customer", [d.id, t["transaction_id"]],
+                            sender=sender or t.get("counterparty_name"), amount=t["amount_gbp"], matched_on=how))
+        cs.edge(d.id, t["transaction_id"], "contradicts")
     if not hits:
         return None
     senders = sorted(set(cs.t(t)["counterparty_name"] for t in tids))
@@ -709,7 +925,8 @@ def first_sentence(text, cap=110):
 
 
 def customer_lines(d):
-    return " ".join(m.group(1) for m in re.finditer(r"^\W*Customer\W*?:\W*\s*(.*)$", d.text, re.M))
+    return " ".join(m.group(1) for m in re.finditer(
+        r"^\W*(?:Customer|Client|Me|User|Account holder)\W*?:\W*\s*(.*)$", d.text, re.M | re.I))
 
 
 def s_mule_chat(cs):
@@ -1069,6 +1286,17 @@ def dob_near(text, name):
             md = DATE_RE.match(win, mm.end())
             if md and match_date(md):
                 return match_date(md)
+    # name written differently ('Mr J. Smith', 'SMITH, John'): the words of the name key must all appear in the
+    # same clause just before the date-of-birth marker
+    key = name_key(name).split()
+    if not key:
+        return None
+    for mm in re.finditer(r"(?:born(?: on)?|DOB:?|date of birth:?)\s*", text, re.I):
+        pre = re.split(r"[.;\n]\s", text[max(0, mm.start() - 100): mm.start()])[-1]
+        if set(key) <= set(norm(pre).split()):
+            md = DATE_RE.match(text, mm.end())
+            if md and match_date(md):
+                return match_date(md)
     return None
 
 
@@ -1210,7 +1438,11 @@ def statement_holders(d):
         if d.fields.get(k):
             h = d.fields[k]
             break
-    names = [x.strip() for x in re.split(r",| and | & (?=\S+ \S)", h) if x.strip()]
+    if re.match(r"^\s*[A-Z][\w'-]+,\s*(?:(?:Mr|Mrs|Ms|Miss|Dr)\.?\s+)?[A-Z][\w'. -]+$", h) and " and " not in h \
+            and " & " not in h:
+        names = [h.strip()]  # 'Surname, Forename' is one holder, not two
+    else:
+        names = [x.strip() for x in re.split(r",| and | & (?=\S+ \S)", h) if x.strip()]
     for m in re.finditer(r"(?:held by|held in the name of|in the name of|registered to|belongs to|belonging to)"
                          r" ([A-Z][\w&' -]+?)(?:\.|,|$)", d.body, re.M):
         names.append(m.group(1).strip())
@@ -1236,7 +1468,7 @@ def x_own_statements(cs, cands):
     out = []
     for d in cs.of_type("bank_statement", "customer_letter", "customer_email", "cancellation_confirmation"):
         holders = statement_holders(d)
-        own = any(h == "__self__" or norm(h) == norm(cs.cname) for h in holders)
+        own = any(h == "__self__" or same_name(h, cs.cname) for h in holders)
         if d.type == "bank_statement" and not own:
             continue
         if d.type != "bank_statement" and not own:
@@ -1273,11 +1505,22 @@ def x_documents(cs, cands):
                 am = money(r.get("amount", ""))
                 for t in cands:
                     if t["direction"] == "out" and norm(t.get("counterparty_name")) == norm(nm) and am and \
-                            abs(am[0] - t["amount_gbp"]) <= 0.01:
+                            round(abs(am[0] - t["amount_gbp"]), 2) <= DOC_AMOUNT_TOL:
                         cov.append(t["transaction_id"])
         else:
             for t in cands:
-                if amount_in(t, d) and (party_match(t, d) or norm(cs.cname) in d.ntext):
+                if not amount_in(t, d, tol=DOC_AMOUNT_TOL):
+                    continue
+                # INVOICE_MATCHES needs amount AND payee: for a payment out the document must name the payee.
+                # A payment in may rest on the customer's own invoice naming the customer as issuer.
+                if t["direction"] == "out" and code == "INVOICE_MATCHES":
+                    named = payee_match(t, d)
+                else:
+                    named = party_match(t, d) or (t["direction"] != "out" and cs.cname and norm(cs.cname) in d.ntext)
+                if not named:
+                    cs.payee_gaps.append((t["transaction_id"], d.id))
+                    continue
+                if True:
                     if d.type == "remittance_advice" and not any(party_match(t, f) for f in has_factoring):
                         continue
                     cov.append(t["transaction_id"])
@@ -1535,15 +1778,59 @@ def case_alert_summary(cs):
 # ----------------------------------------------------------------------------
 # Decision ladder
 # ----------------------------------------------------------------------------
+def data_gap(cs):
+    """Why the alert data cannot support a CLOSE (None when complete)."""
+    if cs.c.get("customer_id") in cs.w.bad_txn_customers:
+        return "a transaction record for this customer is unreadable"
+    if cs.c.get("customer_id") not in cs.w.customers:
+        return "the customer record is not on file"
+    if not (cs.wfrom and cs.wto):
+        return "the review window is missing"
+    ids = list(cs.c.get("alert_ids") or [])
+    if not ids or not cs.alerts:
+        return "no alert on file for this case"
+    if len(cs.alerts) < len(ids):
+        return "alert %s is not on file" % ", ".join(a for a in ids if a not in cs.w.alerts)
+    for a in cs.alerts:
+        tids = a.get("transaction_ids") or []
+        if not isinstance(tids, list):
+            return "alert %s has an unreadable transaction list" % a["alert_id"]
+        if not tids:
+            return "alert %s lists no transactions" % a["alert_id"]
+        missing = [t for t in tids if t not in cs.tx]
+        if missing:
+            return "transaction %s is not on file" % missing[0]
+    amts = [cs.tx[t].get("amount_gbp") for t in cs.alerted]
+    if any(not isinstance(x, (int, float)) or isinstance(x, bool) or x != x or x <= 0 for x in amts):
+        return "an alerted transaction has a missing, zero or negative amount"
+    return None
+
+
 def decide(cs):
     """Returns (code, reason, evidence, trace_extra)."""
     trace = {"reconciliation": [], "tm22": []}
-    # 1. suspicion facts -> ESCALATE
+    gap = data_gap(cs)
+    # 1. suspicion facts -> ESCALATE (with incomplete data a rule that cannot run is skipped, never fatal)
     for rule in SUSPICION_RULES:
+        if gap:
+            try:
+                f = rule(cs)
+            except Exception:
+                continue
+            if f:
+                cs.fire(f.rule, f.code, f.facts)
+                return f.code, f.reason, f.evidence, trace
+            continue
         f = rule(cs)
         if f:
             cs.fire(f.rule, f.code, f.facts)
             return f.code, f.reason, f.evidence, trace
+    # 1b. incomplete alert data never closes: unresolved alerts/transactions or a non-positive alerted total
+    if gap:
+        cs.fire("G1_incomplete_alert_data", "RFI_SOURCE_OF_FUNDS", [])
+        return ("RFI_SOURCE_OF_FUNDS", "The alert data for this case is incomplete (%s), so the activity cannot be "
+                "reconciled. Ask the customer for evidence of the source and purpose of the alerted funds." % gap,
+                [a["alert_id"] for a in cs.alerts] + cs.alerted[:6], trace)
     # 2. internal list
     tm22 = []
     for a in cs.alerts_of("TM22"):
@@ -1636,9 +1923,17 @@ def decide(cs):
                                                        res.get("entry"), res.get("lname"), res.get("basis"),
                                                        ask.split("; ")[0] + "."))
         else:
-            reason = ("Alert %s (%s) is not fully explained: %s of the alerted %s is not reconciled to any document "
-                      "on file. %s" % (a0["alert_id"], a0["rule_id"], fmt(r0["unexplained_gbp"]) if
-                                       r0["unexplained_gbp"] else "part", fmt(r0["alerted_gbp"]), ask))
+            gaps = [(t, d) for t, d in cs.payee_gaps if t in r0["unexplained_txns"]]
+            why = "is not reconciled to any document on file"
+            if gaps:
+                # amount matched but the document names someone other than the payee: not an INVOICE_MATCHES ground
+                why = ("is not reconciled: %s matches the amount of %s but names a different payee from the one "
+                       "paid" % (gaps[0][1], gaps[0][0]))
+                code = "RFI_PURPOSE_DOCUMENTS" if code != "RFI_BUSINESS_RECORDS" else code
+                ev = ev + [gaps[0][1], gaps[0][0]]
+            reason = ("Alert %s (%s) is not fully explained: %s of the alerted %s %s. %s" % (
+                a0["alert_id"], a0["rule_id"], fmt(r0["unexplained_gbp"]) if r0["unexplained_gbp"] else "part",
+                fmt(r0["alerted_gbp"]), why, ask))
         cs.fire("R_RFI", code, [], alert=a0["alert_id"])
         return code, reason, ev, trace
     # 3b. payments_fx: held payment >= threshold to a non-client needs an invoice
@@ -1664,7 +1959,14 @@ def decide(cs):
                                        fmt(m.get("baseline_gbp") or 0), ", ".join(docs), cs.pol["own_account_rfi_multiple"]))
             cs.fire("R_OWN_ACCOUNT_PROFILE_UPDATE", "RFI_UPDATED_PROFILE", [])
             return "RFI_UPDATED_PROFILE", reason, [a["alert_id"]] + docs, trace
-    # 5. CLOSE: every alert reconciled
+    # 5. CLOSE: every alert reconciled -- but never with an unexplained fraud report on file
+    if cs.unmatched_fraud:
+        ids = sorted(set(cs.unmatched_fraud))
+        cs.fire("G2_unmatched_fraud_report", "RFI_SOURCE_OF_FUNDS", [])
+        return ("RFI_SOURCE_OF_FUNDS", "A sending bank has reported a scam payment to this customer (%s), but the report "
+                "could not be tied to a transaction in the review window, so the case cannot be closed. Ask the customer "
+                "to explain the payment the report describes and provide evidence of where the funds came from." %
+                ", ".join(ids), ids + [a["alert_id"] for a in cs.alerts] + cs.alerted[:6], trace)
     codes = set(e.code for e in expls)
     if any(r.get("list_status") == "cleared" for r in recs):
         codes.add("LIST_MATCH_DIFFERENT_PARTY")
@@ -1798,7 +2100,9 @@ def fallback(cs, err):
 # ----------------------------------------------------------------------------
 # Output
 # ----------------------------------------------------------------------------
-def finalize_evidence(cs, ev, code):
+def finalize_evidence(cs, ev, code, reason=""):
+    # every document, transaction, alert or list entry the reason names is part of the evidence
+    ev = list(ev) + [w for w in re.findall(r"[A-Za-z0-9][\w-]*\w", reason or "") if w in cs.valid_ids]
     ev = [e for e in ev if e in cs.valid_ids]
     if cs.held and cs.held in cs.valid_ids:
         ev.append(cs.held)
@@ -2048,7 +2352,7 @@ def run_case(world, case, want_kg=False):
         ev, extra, fell = [a["alert_id"] for a in cs.alerts], {"error": repr(err)}, True
     verdict = VERDICT_OF.get(code, "ESCALATE")
     reason = clamp_reason(reason, cs)
-    ev = finalize_evidence(cs, ev, code)
+    ev = finalize_evidence(cs, ev, code, reason)
     if not ev:
         ev = sorted(a["alert_id"] for a in cs.alerts)
     out = {"case_id": cs.id, "alert_ids": list(case.get("alert_ids", [])), "verdict": verdict, "reason_code": code,
@@ -2072,7 +2376,11 @@ def main(argv):
     folder, outp = args
     world = World(folder)
     if pol:
-        applied = load_policy_overrides(pol[0], world.inst)
+        try:
+            applied = load_policy_overrides(pol[0], world.inst)
+        except (OSError, ValueError) as err:
+            sys.stderr.write("run: rejected policy file %s: %s\n" % (pol[0], err))
+            return 2
         sys.stderr.write("policy overrides for %s: %s\n" % (world.inst, json.dumps(applied, sort_keys=True)))
     lines, tlines, kg, falls = [], [], set(), 0
     for case in world.cases:
@@ -2096,6 +2404,8 @@ def main(argv):
         with open(outp + ".kg.ttl", "w", encoding="utf-8") as fh:
             fh.write(TTL_HEADER % (ONTO_NS, re.sub(r"\W", "_", world.inst)))
             fh.write("\n".join(sorted(kg)) + "\n")
+    if SKIPPED_LINES:
+        sys.stderr.write("skipped malformed input lines: %s\n" % json.dumps(SKIPPED_LINES, sort_keys=True))
     sys.stderr.write("%d cases, %d fallback\n" % (len(lines), falls))
     return 0
 

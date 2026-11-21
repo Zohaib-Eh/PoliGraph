@@ -1,0 +1,38 @@
+@import "tailwindcss";
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/geist-mono";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono Variable", ui-monospace, monospace;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--foreground);
+  --color-border: var(--border);
+  --color-ring: var(--ring);
+  --color-brand: var(--brand);
+  --animate-beam: beam 3.2s linear infinite;
+  --animate-shimmer: shimmer 2.4s linear infinite;
+}
+:root {
+  --background: #09090b; --foreground: #ededef; --card: #0f0f12;
+  --primary: #ededef; --primary-foreground: #09090b;
+  --muted: #18181b; --muted-foreground: #8b8b95;
+  --accent: #1c1c21; --border: #ffffff14; --ring: #7eb6ff; --brand: #7eb6ff;
+}
+@keyframes beam { from { offset-distance: 0%; } to { offset-distance: 100%; } }
+@keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+html { scroll-behavior: smooth; scroll-padding-top: 80px; color-scheme: dark; }
+body { background: var(--background); color: var(--foreground); font-family: var(--font-sans); -webkit-font-smoothing: antialiased; font-feature-settings: "cv11", "ss01"; }
+::selection { background: #7eb6ff40; }
+.text-balance { text-wrap: balance; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } *, *::before, *::after { animation: none !important; transition: none !important; } }

@@ -9,14 +9,14 @@ This is Python 3 with the standard library only, so there's nothing to install. 
 
 ## 0. Normalisation layer
 
-Before any rule reads them, every evidence document goes through `normalise()`, and so does every free-text string in the jsonl inputs. Each step is a fixed, ordered table, so the result is deterministic. Text that is already canonical comes back unchanged, which is why the output on the supplied data is byte-identical to before.
+Before any rule reads them, every evidence document goes through `normalise()`, and so does every free-text string in the jsonl inputs. Each step is a fixed, ordered table, so the result is deterministic. Text that is already canonical comes back unchanged, so verdicts on the supplied data are unchanged.
 
 | Step | Variants accepted | Canonical form |
 |---|---|---|
 | Characters | Non-breaking and thin spaces, curly double quotes, en/em dashes, tabs | Space, `"`, `-` |
 | Whitespace | Runs of spaces; lines broken mid-sentence | One space; the lines rejoined |
-| Money | `GBP 9680.13`, `GBP9680.13`, `9,680.13 GBP`, `9680.13 pounds (sterling)`, `sterling 9,680.13`, `STG …`, `£ 9680.13` | `£9,680.13` |
-| Dates | `2026-09-14`, `14/09/2026`, `14-09-2026`, `14.09.2026` (UK day-first), `September 14, 2026`, `14th Sep 2026`, `14th of September 2026` | `14 September 2026` |
+| Money | `GBP 9680.13`, `GBP9680.13`, `9,680.13 GBP`, `9680.13 pounds (sterling)`, `sterling 9,680.13`, `STG …`, `£ 9680.13`; European `9 680,13 GBP` / `£9.680,13`; multipliers `£12.5k`, `£1.2m`, `£3 million` | `£9,680.13` (numbers with broken thousands grouping such as `1,23,456` are not read as money) |
+| Dates | `2026-09-14`, `14/09/2026`, `14-09-2026`, `14.09.2026` (UK day-first), `September 14, 2026`, `14th Sep 2026`, `14th of September 2026`; US `09/14/2026` only when unambiguous (second number > 12) | `14 September 2026` |
 | Field labels | `Remit to`, `Payee`, `Balance due`, `Total due`, `Name(s) on account`, `Date of incorporation`, `DOB` … | `Pay to`, `Amount due`, `Account holder(s)`, `Incorporated`, `Date of birth` |
 | Label and table-header abbreviations | `Acct`, `No.`, `Ref.`, `Dir.`, `Co.` | Account, number, reference, director, company |
 | Company legal forms | `Limited`, `Ltd.`, `LIMITED`, `P.L.C.`, `Limited Liability Partnership` | `Ltd`, `plc`, `LLP` (and `norm()` treats limited = ltd) |
@@ -27,7 +27,9 @@ The parsers themselves also stay tolerant as a second line of defence:
 - `DATE_RE` and `pdate` accept every date form above.
 - The dissolved-date and date-of-birth readers use the shared date grammar.
 - `statement_holders` accepts `held by / in the name of / registered to / belongs to`.
-- The mule-chat pattern accepts `keep/retain/take N % / per cent / percent / cut`.
+- The mule-chat pattern accepts `keep/retain/take N % / per cent / percent / cut`; chat speaker labels are case-insensitive (`Customer`, `Client`, `Me`, `User`, `Account holder`).
+- Tables: markdown tables, plus bullet or plain rows written `Key: value; Key: value`.
+- Names are compared with a shared `name_key` (titles Mr/Mrs/Ms/Miss/Dr, initials, `(UK)` and legal forms dropped; `Surname, Forename` reordered; at least two words must remain). It is used for own-account holders, scam-report senders and date-of-birth lookups.
 
 ## 1. Ontology
 Each case is loaded into a small graph:
@@ -42,7 +44,7 @@ Documents are parsed with regex into `**Field:** value` pairs, markdown tables, 
 
 ## 2. Rules, in ladder order
 1. **Suspicion rules mean ESCALATE.** Any single one decides the case, and it overrides any documents that would otherwise explain the activity:
-   - a scam report names a sender, or a chat describes a mule role → `ESC_MULE_ACTIVITY`
+   - a scam report ties to an inbound payment (by sender name, by amount and date within 2 days, or by amount into the customer's `account ending NNNN`), or a chat describes a mule role → `ESC_MULE_ACTIVITY`. A scam report that ties to no payment blocks CLOSE (`RFI_SOURCE_OF_FUNDS`)
    - a staff note talks about staying under a threshold → `ESC_STRUCTURING`
    - the payer company was dissolved before it paid → `ESC_UNEXPLAINED_FUNDS`
    - money is paid on to the director's newly formed companies beyond the documented fee → `ESC_PASS_THROUGH`
@@ -58,7 +60,7 @@ Documents are parsed with regex into `**Field:** value` pairs, markdown tables, 
    - **Name match:** the DOB in a gift letter or register is compared with the list DOB. The same DOB means confirmed; a different DOB means cleared.
    - Anything else stays unsettled and becomes `RFI_COUNTERPARTY_DETAILS`.
 3. **Explanation rules.** Each one links documents to the transactions they explain:
-   - a document's amount matches the transaction to the penny, and it names the party or the customer
+   - a document's amount (invoice, contract, payment file, letter or receipt) matches the transaction **exactly to the penny** (both rounded to pence first, so float noise cannot matter; `DOC_AMOUNT_TOL = 0`), and it names the counterparty (name words or account digits; the payment reference is not used). For a payment **out** against an invoice (`INVOICE_MATCHES`), the invoice's own payee (`Pay to` / `Supplier` / heading, not the index title) must name the counterparty; an account-number match counts only when the invoice names no payee. An invoice with the right amount but a different payee does not explain the payment, so the alert stays open → RFI naming the mismatch. (RFI rather than `ESC_INVOICE_MISMATCH`: that code is kept for affirmative red flags such as goods that do not fit the trade; a payee mismatch can be innocent, and RFI is the cheaper error if it is.)
    - own-account statement: the customer is a named holder and the account's last 4 digits match
    - a booking lists every payer as a traveller
    - a group structure gives both companies the same owner
@@ -82,11 +84,15 @@ Documents are parsed with regex into `**Field:** value` pairs, markdown tables, 
    - Own-account explanation at ≥ 5x the profile → `RFI_UPDATED_PROFILE`.
    - Otherwise **CLOSE**, but only when every alert reconciles. The close code is the most specific explanation used (see `CLOSE_PRIORITY`).
 6. **Safety.** Each case runs inside try/except. If something fails, the fallback is ESC when suspicion keywords appear and RFI otherwise, never CLOSE.
+   - Incomplete data never closes: an alert or alerted transaction that is not on file, an alert with no transactions, a zero/negative/non-numeric alerted amount, a missing customer record or review window, or an unreadable transaction record for the customer → `RFI_SOURCE_OF_FUNDS` (suspicion rules still run first and can escalate).
+   - Malformed jsonl lines are skipped, counted and reported on stderr; a missing file just means no records.
+   - Evidence file paths are confined to the institution folder (resolved with `realpath`); anything pointing outside falls back to `evidence/<doc_id>.md`.
+   - The institution type comes from `cases.jsonl`, else the folder name, else the first heading of `POLICY.md` ("Payments and FX firm", "E-money firm", "Investment firm", "Bank").
 
 ## 3. Output
 - **Fields:** `case_id, alert_ids, verdict, reason_code, reason, evidence`, always in that order.
 - **reason:** 2–4 templated sentences (enforced by `clamp_reason`, whose sentence splitter ignores abbreviations such as "Sp. z o.o.", quoted text and parentheses) with this case's names, amounts, dates and document IDs. For an RFI it is the exact ask.
-- **evidence:** sorted and deduplicated, and filtered to IDs that exist in this case's files. It always includes the deciding documents and, for payments_fx, the held payment.
+- **evidence:** sorted and deduplicated, and filtered to IDs that exist in this case's files. It always includes the deciding documents, every ID the reason names, and, for payments_fx, the held payment.
 
 ## 4. Trace (`--trace`)
 One JSON line per case:
@@ -117,5 +123,5 @@ Inputs are read in file order; documents are sorted by ID and transactions by ti
 `system/run <folder> <out.jsonl> --policy=policy-overrides.json` applies an approved change from the viewer's Import page
 (`{"schema": "poligraph.policy-overrides/1", "institution": "bank", "overrides": {...}}`). Keys: `tm02_min`,
 `invoice_required_gbp`, `own_account_rfi_multiple`, `tm01_limit_multiple_individual`, `tm01_limit_multiple_business`
-(null = use the alert's own limit). Unknown keys are rejected. Without the flag the defaults from POLICY.md apply and
+(null = use the alert's own limit). Unknown keys, booleans and negative numbers are rejected; a bad or unreadable policy file exits with code 2 and a one-line message, no traceback. Without the flag the defaults from POLICY.md apply and
 outputs are byte-identical to the official run.

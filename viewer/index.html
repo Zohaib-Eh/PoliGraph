@@ -1,6 +1,7 @@
 <!doctype html>
 <html lang="en">
 <head>
+<script>if(!location.hash||location.hash==="#"||location.hash==="#/"){location.replace("landing.html");}</script>
 <meta charset="utf-8">
 <title>PoliGraph</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -10,12 +11,13 @@
 <body>
 <div class="shell">
   <nav class="side" aria-label="Main">
-    <a class="logo" href="#/">
+    <a class="logo" href="#/overview">
       <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><circle cx="5" cy="12" r="2.4"/><circle cx="12" cy="5" r="2.4"/><circle cx="12" cy="19" r="2.4"/><circle cx="19" cy="12" r="2.4"/><path d="M7 11l3.4-4.2M7 13l3.4 4.2M14 6.8l3.4 4.2M14 17.2l3.4-4.2"/></svg>
       <span><b>PoliGraph</b><i>A reasoning engine, not a guessing engine.</i></span>
     </a>
     <div class="nav" id="nav">
-      <a href="#/" data-r="overview"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>Overview</a>
+      <a href="landing.html"><svg viewBox="0 0 24 24"><path d="M3 11l9-7 9 7M5 10v10h14V10"/></svg>Home</a>
+      <a href="#/overview" data-r="overview"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>Overview</a>
       <a href="#/queue" data-r="queue"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>Queue</a>
       <a href="#/rules" data-r="rules"><svg viewBox="0 0 24 24"><path d="M6 3v18M6 7h9l-2 3 2 3H6"/></svg>Rules</a>
       <a href="#/about" data-r="about"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/></svg>How it works</a>

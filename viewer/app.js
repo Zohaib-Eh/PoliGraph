@@ -10,7 +10,8 @@
   const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
   const ONTO = window.PROOF_ONTOLOGY || { nodeClass: {}, docClass: {}, edgeProp: {}, tree: "" };
   const INSTS = window.PROOF_INSTS || [];
-  const LABEL = { bank: "Bank", emoney: "E-money", investment: "Investment", payments_fx: "Payments / FX" };
+  const LABEL = { all: "All institutions", bank: "Bank", emoney: "E-money", investment: "Investment", payments_fx: "Payments / FX" };
+  const SHORT = { all: "All", bank: "Bank", emoney: "E-money", investment: "Investment", payments_fx: "Payments FX" };
   const PREFIX = { BK: "bank", EM: "emoney", IV: "investment", PX: "payments_fx" };
   const londonTime = (iso) => new Date(iso).toLocaleString("en-GB", { timeZone: "Europe/London", day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" }) + " London";
 
@@ -94,24 +95,63 @@
       document.body.appendChild(s);
     });
   }
+  function loadScript(src) {
+    return new Promise((res, rej) => {
+      const s = document.createElement("script"); s.src = src;
+      s.onload = res; s.onerror = () => rej(new Error("Could not load " + src + ". Run python3 viewer/build_data.py"));
+      document.body.appendChild(s);
+    });
+  }
+  /* "all" = the four dev institutions combined; rows carry their institution */
+  async function ensureAll() {
+    const ds = await Promise.all(INSTS.map(ensureInst));
+    ds.forEach((d) => d.rows.forEach((r) => (r.inst = r.inst || d.inst)));
+    const runs = ds.map((d) => ({ inst: d.inst, runs: d.runs || [] }));
+    return { inst: "all", rows: [].concat(...ds.map((d) => d.rows)), detail: {}, demos: (ds[0] && ds[0].demos) || {}, runs: [], instRuns: runs, all: true };
+  }
+  /* detail for one case: inline (Import / old bundles) or a lazy shard data/detail/<inst>-<k>.js */
+  const detailOf = (r) => { const inst = r.inst || S.inst; const d = window.PROOF_DATA[inst];
+    return (d && d.detail && d.detail[r.id]) || ((window.PROOF_DETAIL || {})[inst] || {})[r.id] || null; };
+  async function ensureDetail(r) {
+    if (!r || detailOf(r) || r.shard == null) return;
+    await loadScript("data/detail/" + (r.inst || S.inst) + "-" + r.shard + ".js");
+  }
   async function setInst(inst) {
     if (S.inst === inst && S.data) return;
     stopReplay();
-    const d = await ensureInst(inst);
+    const d = inst === "all" ? await ensureAll() : await ensureInst(inst);
+    if (inst !== "all") d.rows.forEach((r) => (r.inst = r.inst || inst));
     S.inst = inst; S.data = d; S.rows = d.rows; S.decided = null; S.cy = null;
     S.q.rule = ""; S.q.code = ""; S.q.limit = 150;
     renderSide();
   }
   function renderSide() {
     const sel = $("#instSel");
-    const list = INSTS.concat(Object.keys(S.extra));
+    const list = (INSTS.length > 1 ? ["all"] : []).concat(INSTS, Object.keys(S.extra));
     sel.innerHTML = list.map((i) => `<option value="${esc(i)}"${i === S.inst ? " selected" : ""}>${esc(instLabel(i))}</option>`).join("");
     const runs = (S.data && S.data.runs) || [];
     const hs = new Set(runs.map((r) => r.verdict_code_hash));
+    const rp = repro();
+    if (S.data && S.data.all) { $("#repro").innerHTML = `<span class="dot" style="background:${rp.ok ? css("--close") : css("--esc")}"></span>${rp.text}`; return; }
     $("#repro").innerHTML = runs.length ? `<span class="dot" style="background:${hs.size === 1 ? css("--close") : css("--esc")}"></span>${hs.size === 1 ? runs.length : "!"}/${runs.length} identical runs` :
       `<span class="dot" style="background:${css("--faint")}"></span>${S.extra[S.inst] ? "session run" : "1 run"}`;
   }
-  $("#instSel").onchange = async (e) => { await setInst(e.target.value); const r = parseHash(); if (r.page === "case") location.hash = "#/queue"; else route(); };
+  /* reproducibility summary: per institution, every run must give the same verdict+code hash */
+  function repro() {
+    const groups = S.data && S.data.all ? S.data.instRuns : [{ inst: S.inst, runs: (S.data && S.data.runs) || [] }];
+    const okAll = groups.every((g) => g.runs.length > 1 && new Set(g.runs.map((r) => r.verdict_code_hash)).size === 1);
+    const n = groups.length ? Math.min(...groups.map((g) => g.runs.length)) : 0;
+    const text = n ? (okAll ? `${n}/${n} identical runs` + (groups.length > 1 ? ` × ${groups.length}` : "") : "runs differ") : "1 run";
+    return { ok: okAll, n, groups, text };
+  }
+  async function switchInst(inst) { await setInst(inst); const r = parseHash(); if (r.page === "case") location.hash = "#/queue"; else route(); }
+  $("#instSel").onchange = (e) => switchInst(e.target.value);
+  /* institution switcher shown on Overview and Queue */
+  function instSeg() {
+    const list = INSTS.length > 1 ? ["all"].concat(INSTS) : INSTS;
+    return `<div class="seg inst-seg" id="instSeg" role="tablist" aria-label="Institution">${list.map((i) => `<button data-i="${i}" class="${S.inst === i ? "on" : ""}">${esc(SHORT[i] || instLabel(i))}</button>`).join("")}</div>`;
+  }
+  function wireInstSeg(main) { $$("#instSeg button", main).forEach((b) => (b.onclick = () => switchInst(b.dataset.i))); }
 
   /* ---------- router ---------- */
   function parseHash() {
@@ -126,15 +166,16 @@
     try {
       if (!S.data) {
         if (!INSTS.length) { main.innerHTML = `<div class="page"><div class="empty"><h2>No data bundle</h2><p>Run <span class="mono">python3 viewer/build_data.py</span>.</p></div></div>`; return; }
-        await setInst(new URLSearchParams(location.search).get("inst") || INSTS[0]);
+        await setInst(new URLSearchParams(location.search).get("inst") || (INSTS.length > 1 ? "all" : INSTS[0]));
       }
       if (r.page === "case") {
         const id = r.args[0];
         if (!S.rows.some((x) => x.id === id)) {
           const guess = PREFIX[(id || "").slice(0, 2)];
           const other = Object.keys(S.extra).find((k) => window.PROOF_DATA[k].rows.some((x) => x.id === id));
-          if (guess && guess !== S.inst && !other) await setInst(guess);
+          if (guess && guess !== S.inst && !other) await setInst(INSTS.length > 1 ? "all" : guess);
         }
+        await ensureDetail(rowOf(id));
       }
       const fn = { overview: pageOverview, queue: pageQueue, case: pageCase, rules: pageRules, about: pageAbout, import: pageImport }[r.page] || pageOverview;
       hidePop();
@@ -172,8 +213,8 @@
 
   /* ---------- Overview ---------- */
   function pageOverview(main) {
-    const c = counts(S.rows), runs = S.data.runs || [];
-    const ok = runs.length > 1 && new Set(runs.map((r) => r.verdict_code_hash)).size === 1;
+    const c = counts(S.rows), runs = S.data.runs || [], rp = repro();
+    const ok = rp.ok;
     const hours = (c.closedAlerts * 20) / 60;
     const k = (label, v, sub, cls) => `<div class="kpi ${cls || ""}"><div class="k">${label}</div><div class="v">${v}</div><div class="s">${sub || "&nbsp;"}</div></div>`;
     const byId = Object.fromEntries(S.rows.map((r) => [r.id, r]));
@@ -183,15 +224,19 @@
     const top = Object.entries(codes).sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).slice(0, 7);
     const max = top.length ? top[0][1] : 1;
     const VERD = (code) => (/^ESC_/.test(code) ? "ESCALATE" : /^RFI_/.test(code) ? "RFI" : "CLOSE");
-    main.innerHTML = page(ph("Overview", `${esc(instLabel(S.inst))} · ${n0(c.n)} alert cases triaged by the rule engine`) + `
+    const instN = S.data.all ? INSTS.length : 1;
+    main.innerHTML = page(ph("Overview", `${esc(instLabel(S.inst))} · ${n0(c.n)} alert cases triaged by the rule engine${S.data.all ? ` across ${instN} institutions` : ""}`, instSeg()) + `
       <div class="kpis">
         ${k("Cases decided", n0(c.n), "every case gets a verdict")}
         ${k("Close", n0(c.CLOSE), `${Math.round((100 * c.CLOSE) / (c.n || 1))}% of cases`)}
         ${k("Request info", n0(c.RFI), `${Math.round((100 * c.RFI) / (c.n || 1))}% of cases`)}
         ${k("Escalate", n0(c.ESCALATE), `${Math.round((100 * c.ESCALATE) / (c.n || 1))}% of cases`)}
         ${k("Analyst hours saved", n0(hours) + '<span class="u">h</span>', "20 min per alert closed")}
-        ${k("Reproducibility", runs.length ? (ok ? `${runs.length}/${runs.length} identical` : "mismatch") : "1 run", runs.length ? `hash ${runs[0].verdict_code_hash.slice(0, 10)}` : "session run", "repro-k")}
+        ${S.data.all ? k("Reproducibility", rp.n ? (ok ? `${rp.n}/${rp.n} identical` : "mismatch") : "1 run", `in each of ${instN} institutions`, "repro-k")
+          : k("Reproducibility", runs.length ? (ok ? `${runs.length}/${runs.length} identical` : "mismatch") : "1 run", runs.length ? `hash ${runs[0].verdict_code_hash.slice(0, 10)}` : "session run", "repro-k")}
       </div>
+      ${S.data.all ? `<div class="card" style="margin-bottom:20px"><h2>By institution</h2><p class="hint">Verdict mix per institution. Click one to filter.</p>
+        <table class="tbl inst-tbl"><thead><tr><th>Institution</th><th class="r">Cases</th><th class="r">Close</th><th class="r">RFI</th><th class="r">Escalate</th><th style="width:38%">Mix</th></tr></thead><tbody>${INSTS.map((i) => { const ci = counts(S.rows.filter((r) => r.inst === i)); return `<tr class="row" data-i="${i}"><td>${esc(instLabel(i))}</td><td class="r num">${n0(ci.n)}</td><td class="r num">${n0(ci.CLOSE)}</td><td class="r num">${n0(ci.RFI)}</td><td class="r num">${n0(ci.ESCALATE)}</td><td><div class="mix sm">${["CLOSE", "RFI", "ESCALATE"].map((v) => `<div style="flex:${ci[v] || 0};background:${css(VCOL[v])}"></div>`).join("")}</div></td></tr>`; }).join("")}</tbody></table></div>` : ""}
       <div class="grid g-main">
         <div class="stack">
           <div class="card"><h2>Verdict mix</h2><p class="hint">Share of cases per verdict.</p>${mixBar(c)}</div>
@@ -203,6 +248,8 @@
         </div>
       </div>`);
     $$("a[data-code]", main).forEach((a) => (a.onclick = () => { S.q.code = a.dataset.code; S.q.v = "ALL"; }));
+    $$(".inst-tbl tr[data-i]", main).forEach((tr) => (tr.onclick = () => switchInst(tr.dataset.i)));
+    wireInstSeg(main);
   }
 
   /* ---------- Queue ---------- */
@@ -216,11 +263,11 @@
   }
   function sorted(rows) {
     const k = S.q.sort, d = S.q.dir;
-    const key = { id: (r) => r.id, name: (r) => (r.name || "").toLowerCase(), rule: (r) => r.rules.join(","), amount: (r) => r.amount, verdict: (r) => ({ ESCALATE: 0, RFI: 1, CLOSE: 2 }[r.verdict]), code: (r) => words(r.code) }[k];
+    const key = { id: (r) => r.id, inst: (r) => r.inst || "", name: (r) => (r.name || "").toLowerCase(), rule: (r) => r.rules.join(","), amount: (r) => r.amount, verdict: (r) => ({ ESCALATE: 0, RFI: 1, CLOSE: 2 }[r.verdict]), code: (r) => words(r.code) }[k];
     return rows.slice().sort((a, b) => { const x = key(a), y = key(b); return (x < y ? -1 : x > y ? 1 : a.id < b.id ? -1 : 1) * d; });
   }
   function rowHTML(r, arrive) {
-    return `<tr class="row${arrive ? " arrive" : ""}" data-id="${r.id}"><td class="cid">${r.id}</td><td>${esc(r.name)}</td>
+    return `<tr class="row${arrive ? " arrive" : ""}" data-id="${r.id}"><td class="cid">${r.id}</td>${S.data && S.data.all ? `<td class="sub2">${esc(SHORT[r.inst] || r.inst)}</td>` : ""}<td>${esc(r.name)}</td>
       <td><span class="mono">${r.rules.slice(0, 2).join(" + ")}${r.rules.length > 2 ? " +" + (r.rules.length - 2) : ""}</span><div class="muted">${esc(tmWords(r.rules[0]))}</div></td>
       <td class="r num">${gbp0(r.amount)}</td><td>${S.replay && !r._done ? '<span class="pill pending">Deciding</span>' : pill(r.verdict)}</td><td class="sub2">${esc(words(r.code))}${r.detail ? "" : ' <span class="chip" title="Rebuild with --detail 1000 for its graph">summary</span>'}</td></tr>`;
   }
@@ -228,7 +275,7 @@
     const rules = [...new Set(S.rows.flatMap((r) => r.rules))].sort();
     const codes = [...new Set(S.rows.map((r) => r.code))].sort((a, b) => (words(a) < words(b) ? -1 : 1));
     const th = (k, label, cls) => `<th data-k="${k}" class="${cls || ""}">${label}${S.q.sort === k ? `<span class="arr">${S.q.dir > 0 ? "↑" : "↓"}</span>` : ""}</th>`;
-    main.innerHTML = page(ph("Queue", `${esc(instLabel(S.inst))} · every alert case and its verdict`, `<button class="btn ${S.replay ? "live" : ""}" id="replayBtn">${S.replay ? "Stop replay" : "▶ Replay the queue"}</button>`) + `
+    main.innerHTML = page(ph("Queue", `${esc(instLabel(S.inst))} · every alert case and its verdict`, `<div class="ph-r">${instSeg()}<button class="btn ${S.replay ? "live" : ""}" id="replayBtn">${S.replay ? "Stop replay" : "▶ Replay the queue"}</button></div>`) + `
       <div class="toolbar">
         <input type="search" id="qText" placeholder="Search case or customer" value="${esc(S.q.text)}">
         <div class="seg" id="qV">${["ALL", "CLOSE", "RFI", "ESCALATE"].map((v) => `<button data-v="${v}" class="${S.q.v === v ? "on" : ""}">${{ ALL: "All", CLOSE: "Close", RFI: "RFI", ESCALATE: "Escalate" }[v]}</button>`).join("")}</div>
@@ -236,7 +283,7 @@
         <select id="qCode"><option value="">All reasons</option>${codes.map((c) => `<option value="${c}"${S.q.code === c ? " selected" : ""}>${esc(words(c))}</option>`).join("")}</select>
       </div>
       <div class="live-strip" id="live"></div>
-      <div class="card tblwrap"><table class="tbl"><thead><tr>${th("id", "Case")}${th("name", "Customer")}${th("rule", "Rule")}${th("amount", "Amount alerted", "r")}${th("verdict", "Verdict")}${th("code", "Reason")}</tr></thead><tbody id="qBody"></tbody></table><div class="more" id="qMore"></div></div>`);
+      <div class="card tblwrap"><table class="tbl"><thead><tr>${th("id", "Case")}${S.data.all ? th("inst", "Institution") : ""}${th("name", "Customer")}${th("rule", "Rule")}${th("amount", "Amount alerted", "r")}${th("verdict", "Verdict")}${th("code", "Reason")}</tr></thead><tbody id="qBody"></tbody></table><div class="more" id="qMore"></div></div>`);
     $("#qText").oninput = (e) => { S.q.text = e.target.value.trim(); S.q.limit = 150; drawTable(); };
     $$("#qV button").forEach((b) => (b.onclick = () => { S.q.v = b.dataset.v; $$("#qV button").forEach((x) => x.classList.toggle("on", x === b)); S.q.limit = 150; drawTable(); }));
     $("#qRule").onchange = (e) => { S.q.rule = e.target.value; drawTable(); };
@@ -244,6 +291,7 @@
     $$("th[data-k]", main).forEach((t) => (t.onclick = () => { if (S.replay) return; S.q.dir = S.q.sort === t.dataset.k ? -S.q.dir : 1; S.q.sort = t.dataset.k; pageQueue(main); }));
     $("#qBody").onclick = (e) => { const tr = e.target.closest("tr.row"); if (tr) go("#/case/" + tr.dataset.id); };
     $("#replayBtn").onclick = () => (S.replay ? stopReplay() : startReplay());
+    wireInstSeg(main);
     drawTable();
   }
   function drawTable() {
@@ -251,7 +299,7 @@
     if (S.replay) { liveStrip(); return; }
     const vis = sorted(S.rows.filter(match));
     S.visible = vis;
-    body.innerHTML = vis.slice(0, S.q.limit).map((r) => rowHTML(r)).join("") || `<tr><td colspan="6" class="empty">No cases match these filters.</td></tr>`;
+    body.innerHTML = vis.slice(0, S.q.limit).map((r) => rowHTML(r)).join("") || `<tr><td colspan="${S.data.all ? 7 : 6}" class="empty">No cases match these filters.</td></tr>`;
     $("#qMore").innerHTML = vis.length > S.q.limit ? `<button class="btn" id="moreBtn">Show more · ${n0(vis.length - S.q.limit)} left</button>` : `<span class="note">${n0(vis.length)} case${vis.length === 1 ? "" : "s"}</span>`;
     const mb = $("#moreBtn"); if (mb) mb.onclick = () => { S.q.limit += 300; drawTable(); };
     liveStrip();
@@ -297,7 +345,7 @@
 
   /* ---------- Case page ---------- */
   const rowOf = (id) => S.rows.find((r) => r.id === id);
-  const caseData = (id) => (S.data.detail || {})[id] || null;
+  const caseData = (id) => { const r = rowOf(id); return r ? detailOf(r) : null; };
   function deciding(d) {
     const s = new Set(); if (!d) return s;
     d.trace.firings.forEach((f) => { if (f.advisory) return; (f.facts || []).forEach((fid) => { const fact = d.trace.facts.find((x) => x.id === fid); if (fact) fact.sources.forEach((x) => s.add(x)); }); (f.docs || []).forEach((x) => s.add(x)); });
@@ -333,12 +381,12 @@
     const tabs = [["decision", "Decision"], ["why", "Why"], ["documents", "Documents"], ["timeline", "Timeline"]];
     main.innerHTML = page(`<a class="crumb" href="#/queue">← Queue</a>
       <div class="case-h"><div>${pill(r.verdict, true)}<h1>${esc(words(r.code))}</h1>
-        <div class="meta"><span class="mono">${r.id}</span><span>${esc(r.name)}</span><span>${r.rules.map((x) => `<span class="mono">${x}</span> ${esc(tmWords(x))}`).join(" · ")}</span><span class="code">${r.code}</span></div></div>
+        <div class="meta"><span class="mono">${r.id}</span>${r.inst ? `<span>${esc(instLabel(r.inst))}</span>` : ""}<span>${esc(r.name)}</span><span>${r.rules.map((x) => `<span class="mono">${x}</span> ${esc(tmWords(x))}`).join(" · ")}</span><span class="code">${r.code}</span></div></div>
         <div class="amt"><div class="v">${gbp(r.amount)}</div><div class="k">alerted · ${r.alerts} alert${r.alerts === 1 ? "" : "s"}</div></div></div>
       <nav class="tabs">${tabs.map(([k, l]) => `<a href="#/case/${r.id}/${k}" class="${k === tab ? "on" : ""}">${l}</a>`).join("")}</nav>
       <div id="tab"></div>`);
     const el = $("#tab");
-    if (!d && tab !== "decision") { el.innerHTML = `<div class="card empty"><h2>Summary only</h2><p>This case's proof is not in the bundle. Rebuild with <span class="mono">python3 viewer/build_data.py --detail 1000</span>.</p></div>`; return; }
+    if (!d && tab !== "decision") { el.innerHTML = `<div class="card empty"><h2>Summary only</h2><p>This case's proof is not in the bundle. Rebuild with <span class="mono">python3 viewer/build_data.py</span> (detail for every case is the default).</p></div>`; return; }
     ({ decision: tabDecision, why: tabWhy, documents: tabDocs, timeline: tabTimeline }[tab] || tabDecision)(el, r, d, args.slice(2));
   }
   function tabDecision(el, r, d) {
@@ -630,7 +678,7 @@
 
   /* ---------- About ---------- */
   function pageAbout(main) {
-    const runs = S.data.runs || [];
+    const runs = S.data.all ? [].concat(...S.data.instRuns.map((g) => g.runs.map((r) => Object.assign({ inst: g.inst }, r)))) : (S.data.runs || []);
     const st = (n, t, p) => `<div class="step"><div class="n">${n}</div><h3>${t}</h3><p>${p}</p></div>`;
     main.innerHTML = page(ph("How it works", "A reasoning engine, not a guessing engine.") + `
       <div class="pipe" style="margin-bottom:20px">
@@ -643,7 +691,7 @@
       </div>
       <div class="grid g2">
         <div class="card"><h2>Deterministic</h2><p class="hint">No randomness, no network, no model in the scored path. Same input, same bytes.</p>
-          ${runs.length ? `<table class="tbl"><thead><tr><th>Run</th><th>Verdict + code hash</th><th>File sha256</th></tr></thead><tbody>${runs.map((r) => `<tr><td class="num">${r.run}</td><td class="cid">${r.verdict_code_hash}</td><td class="cid">${r.file_hash.slice(0, 16)}…</td></tr>`).join("")}</tbody></table>` : '<p class="note">No repeat runs in this bundle.</p>'}</div>
+          ${runs.length ? `<table class="tbl"><thead><tr>${S.data.all ? "<th>Institution</th>" : ""}<th>Run</th><th>Verdict + code hash</th><th>File sha256</th></tr></thead><tbody>${runs.map((r) => `<tr>${S.data.all ? `<td class="sub2">${esc(SHORT[r.inst] || r.inst)}</td>` : ""}<td class="num">${r.run}</td><td class="cid">${r.verdict_code_hash}</td><td class="cid">${r.file_hash.slice(0, 16)}…</td></tr>`).join("")}</tbody></table>` : '<p class="note">No repeat runs in this bundle.</p>'}</div>
         <div class="stack">
           <div class="card"><h2>Evidence you can check</h2><p class="hint" style="margin:0">Every cited ID is checked against the case's own records before it is written. Each fact points back to the documents it came from, and the Documents tab highlights the exact words.</p></div>
           <div class="card"><h2>Fact-checked briefs</h2><p class="hint" style="margin:0">A brief is kept only if every amount, ID and name in it appears in the proof. Anything else is dropped and logged.</p></div>
@@ -668,7 +716,7 @@
       if (nx) go("#/case/" + nx.id + (r.args[1] ? "/" + r.args[1] : ""));
     }
   });
-  const API = { S, $, $$, esc, gbp, gbp0, n0, css, page, ph, pill, words, counts, mixBar, instLabel, renderSide, setInst, go, route, londonTime };
+  const API = { S, $, $$, esc, ensureDetail, detailOf, gbp, gbp0, n0, css, page, ph, pill, words, counts, mixBar, instLabel, renderSide, setInst, go, route, londonTime };
   window.PROOF = { state: S, go, setInst, startReplay, stopReplay, api: API };
   route();
 })();
