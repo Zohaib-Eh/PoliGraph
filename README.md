@@ -10,6 +10,34 @@ PoliGraph triages transaction-monitoring (TM) alerts into **CLOSE**, **RFI** (re
 
 ---
 
+## Why PoliGraph
+
+> **A model gives a number. A regulator asks for a reason.**
+> **Close the explained. Never miss the rest.**
+
+Most TM alerts are false positives, and every one still needs an analyst. PoliGraph closes the ones it can **prove** are explained and escalates the ones with a proven red flag. Everything else becomes one specific RFI. It never closes on a guess.
+
+- **Reasoning, not prediction.** Each verdict is a proof made of three parts: the rule, the facts and the documents. It is not a score with feature weights added afterwards.
+- **No model in the decision.** The engine is deterministic, and reruns are byte-identical.
+- **A ladder you can read top to bottom; the first rung that holds decides:**
+  - **ESCALATE.** A listed party, a mule pattern, a fraud report or a contradiction. Escalation wins even when the money balances.
+  - **RFI.** Money is unexplained but nothing points to crime. Ask for one specific document.
+  - **CLOSE.** Every alerted pound is matched to evidence, with invoices exact to the penny.
+- **Policy changes are instant.** You try a threshold change as a what-if, then apply it through a logged, approved override file. There is no retrain, revalidate and redeploy cycle.
+
+| | PoliGraph | Black-box ML / LLM classifier |
+|---|---|---|
+| Output | A proof: rule, facts, documents; every verdict cites evidence IDs | A score with post-hoc feature weights, or free text |
+| Consistency | Deterministic, byte-identical reruns | Shifts with the model, prompt and threshold |
+| Needs | The policy and the case file | Labelled historical alerts |
+| Policy change | Instant what-if, then a logged approval | Retrain, revalidate, redeploy |
+| When unsure | Asks (RFI) or escalates; never a guessed CLOSE | Can be confidently wrong with no warning |
+| Over time | Rules stay as written | Can decay as behaviour changes |
+
+ML is good at finding new patterns. Once a human approves a pattern it has found, it can become a PoliGraph rule.
+
+---
+
 ## The problem
 
 An analyst working a TM alert has to answer one question: *is every pound that triggered this alert explained by something on file, and is anything on file a red flag?* The costs are lopsided. Closing a case that should have been escalated is far worse than asking one more question.
