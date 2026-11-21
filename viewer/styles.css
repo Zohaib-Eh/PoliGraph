@@ -217,3 +217,144 @@ mark.con{background:var(--esc-bg);color:var(--text);border-bottom:2px solid var(
 .mix.sm{height:8px;margin:0}
 .inst-tbl tr.row{cursor:pointer}
 .tbl td.cid{white-space:nowrap}
+
+/* ======================================================================
+   PoliGraph design system (matches landing.html): monochrome, editorial.
+   Verdict colours and graph node colours are intentionally unchanged.
+   Plex fonts above stay declared because the Cytoscape graphs use them.
+   ====================================================================== */
+@font-face{font-family:"Inter";src:url(vendor/fonts/inter-latin-wght.woff2) format("woff2");font-weight:100 900;font-display:swap}
+@font-face{font-family:"Archivo";src:url(vendor/fonts/archivo-latin-wdth.woff2) format("woff2");font-weight:100 900;font-stretch:62% 125%;font-display:swap}
+@font-face{font-family:"Geist Mono";src:url(vendor/fonts/geist-mono-latin-wght.woff2) format("woff2");font-weight:100 900;font-display:swap}
+:root{
+  --bg:#050505;--panel:#0a0a0a;--panel-2:#151515;--line:#ffffff1f;--line-2:#ffffff38;
+  --text:#f2f2f2;--sub:#b4b4b4;--faint:#a0a0a0;
+  --sans:"Inter",system-ui,sans-serif;--mono:"Geist Mono",ui-monospace,monospace;--serif:"Inter",system-ui,sans-serif;
+  --display:"Archivo","Inter",sans-serif
+}
+html,body{font:15px/1.6 var(--sans);-webkit-font-smoothing:antialiased}
+::selection{background:#f2f2f2;color:#050505}
+.disp{font-family:var(--display);font-stretch:112%;font-weight:560;letter-spacing:-.02em;text-transform:uppercase;line-height:.95}
+
+/* top bar instead of sidebar, like the landing nav */
+.shell{grid-template-columns:minmax(0,1fr);grid-template-rows:64px minmax(0,1fr)}
+.side{flex-direction:row;align-items:center;gap:36px;padding:0 40px;border-right:0;border-bottom:1px solid var(--line);background:#050505e6}
+.logo{padding:0;align-items:center}
+.logo svg{display:none}
+.logo b{font-family:var(--display);font-stretch:112%;font-weight:560;font-size:17px;letter-spacing:.08em;text-transform:uppercase}
+.logo i{display:none}
+.nav{flex-direction:row;gap:4px;margin:0 auto}
+.nav a{padding:8px 12px;border-radius:0;font-family:var(--mono);font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#d6d6d6;gap:0;background:none!important;border-bottom:1px solid transparent}
+.nav a svg{display:none}
+.nav a:hover{color:#fff;border-bottom-color:#ffffff66}
+.nav a.on{color:#fff;border-bottom-color:#fff}
+.side-foot{margin:0;flex-direction:row;align-items:center;gap:12px;padding:0}
+.side-foot .lbl{font-family:var(--mono);font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#c8c8c8}
+.repro{margin:0;font-size:13px;white-space:nowrap}
+select,input[type=search],input[type=text],input[type=number]{border-radius:0;background:#050505;border:1px solid var(--line-2);font-size:14px}
+
+/* pages */
+.page{max-width:1440px;padding:48px 40px 96px;counter-reset:sec}
+.ph{margin-bottom:40px;padding-bottom:24px;border-bottom:1px solid var(--line)}
+.ph h1{font-family:var(--display);font-stretch:112%;font-weight:560;letter-spacing:-.02em;text-transform:uppercase;font-size:44px;line-height:.95}
+.ph p{margin-top:12px;font-size:16px;color:var(--sub);max-width:65ch}
+.crumb{font-family:var(--mono);font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#c8c8c8}
+
+/* cards become hairline panels with numbered mono labels */
+.card{background:transparent;border:1px solid var(--line);border-radius:0;padding:26px 28px}
+.card h2{font-family:var(--mono);font-size:13px;font-weight:500;letter-spacing:.08em;text-transform:uppercase;color:#f2f2f2;margin:0 0 8px;display:flex;align-items:center;gap:12px}
+.card h2::before{counter-increment:sec;content:counter(sec,decimal-leading-zero);color:#c8c8c8}
+.card h2::after{content:"";height:1px;width:28px;background:#ffffff4d;order:-1;display:none}
+.card .hint{color:var(--sub);font-size:14.5px;line-height:1.55;margin:0 0 20px;max-width:65ch}
+.grid,.stack{gap:24px}
+
+/* KPI tiles -> hairline stat row (landing results style) */
+.kpis{gap:0;border-top:1px solid var(--line);border-bottom:1px solid var(--line);margin-bottom:40px}
+.kpi{background:transparent;border:0;border-left:1px solid var(--line);border-radius:0;padding:24px 24px 22px}
+.kpi:first-child{border-left:0;padding-left:0}
+.kpi .k{font-family:var(--mono);font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#c8c8c8}
+.kpi .v{font-family:var(--display);font-stretch:112%;font-weight:560;font-size:36px;letter-spacing:-.02em;margin-top:10px;line-height:1}
+.kpi .v .u{font-family:var(--sans);font-size:14px;letter-spacing:0;text-transform:none}
+.kpi .s{font-size:14px;color:var(--sub);margin-top:8px}
+.kpi.repro-k .v{font-size:28px}
+
+/* verdict badges keep their colours, square corners */
+.pill{border-radius:2px;font-family:var(--mono);font-size:12.5px;letter-spacing:.06em;text-transform:uppercase;padding:4px 9px}
+.pill::before{border-radius:0}
+.pill.lg{font-size:13.5px;padding:6px 12px}
+.mix{border-radius:0;height:10px}
+.mix.sm{border-radius:0}
+.sw{border-radius:0}
+.legend-row{font-size:14px}
+.bar,.bar div{border-radius:0}
+
+/* lists, buttons, segmented controls */
+a.li{border-radius:0}
+a.li:hover{background:#ffffff08}
+.li{padding:16px 2px}
+.li .d{font-size:14.5px}
+.btn{border-radius:0;background:transparent;border:1px solid #ffffff66;font-family:var(--mono);font-size:13px;letter-spacing:.08em;text-transform:uppercase;padding:9px 16px}
+.btn:hover{background:#f2f2f2;color:#050505;border-color:#f2f2f2}
+.btn.primary{background:#f2f2f2;color:#050505;border-color:#f2f2f2;font-weight:500}
+.btn.primary:hover{background:transparent;color:#f2f2f2}
+.btn.live{border-color:var(--close);color:var(--close);background:transparent}
+.qmark{border-radius:0}
+.seg{border-radius:0;padding:0;background:transparent;border:1px solid var(--line-2)}
+.seg button{border-radius:0;font-family:var(--mono);font-size:13px;letter-spacing:.06em;text-transform:uppercase;padding:8px 14px;color:#c8c8c8}
+.seg button.on{background:#f2f2f2;color:#050505}
+.seg button + button{border-left:1px solid var(--line-2)}
+
+/* tables: hairline rows */
+.tblwrap{padding:0 24px 8px}
+.tbl{font-size:14.5px}
+.tbl th{font-family:var(--mono);font-size:12.5px;letter-spacing:.08em;text-transform:uppercase;color:#c8c8c8;font-weight:500;padding:14px 14px;border-bottom:1px solid #ffffff66}
+.tbl td{padding:14px 14px}
+.tbl tr.row:hover{background:#ffffff08}
+.tbl .muted{color:var(--faint)}
+.live-strip b{font-family:var(--display);font-stretch:112%;font-weight:560;font-size:24px}
+
+/* case page */
+.case-h{padding-bottom:24px;border-bottom:1px solid var(--line);margin-bottom:0}
+.case-h h1{font-family:var(--display);font-stretch:112%;font-weight:560;letter-spacing:-.02em;text-transform:uppercase;font-size:38px;line-height:1;margin:16px 0 12px}
+.case-h .meta{font-size:15px}
+.amt .v{font-family:var(--display);font-stretch:112%;font-weight:560;font-size:36px;letter-spacing:-.02em}
+.amt .k{font-family:var(--mono);font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#c8c8c8}
+.tabs{gap:0;margin-bottom:32px}
+.tabs a{font-family:var(--mono);font-size:13px;letter-spacing:.08em;text-transform:uppercase;padding:16px 18px;color:#c8c8c8}
+.tabs a.on{border-bottom-color:#f2f2f2}
+.reason{font-family:var(--sans);font-size:17.5px;line-height:1.65;color:#e6e6e6;max-width:70ch}
+.reason .m{border-radius:0;background:#ffffff12}
+.brief p{font-family:var(--sans);font-size:16px;color:#d6d6d6}
+.recbar{border-radius:0}
+.banner{border-radius:0}
+.chip{border-radius:0;font-family:var(--mono);font-size:12.5px;color:#c8c8c8}
+.code{color:#a0a0a0}
+.note{color:var(--faint);font-size:13.5px}
+
+/* story (Why): keep colours, square the chrome */
+.story .col h3{font-family:var(--mono);font-size:13px;letter-spacing:.08em;color:#c8c8c8}
+.money,.check,.outcome{border-radius:2px;background:var(--panel)}
+.check .ic{border-radius:50%}
+.money .v{font-family:var(--display);font-stretch:112%;font-weight:560;font-size:28px;letter-spacing:-.02em}
+.outcome .w{font-family:var(--display);font-stretch:112%;font-weight:560;text-transform:uppercase;letter-spacing:-.01em;font-size:20px;line-height:1.1}
+
+/* graph container chrome only; node styling lives in app.js and is unchanged */
+.gcard{padding:0}
+.gtools{padding:14px 20px}
+.pop,.gtip{border-radius:0;background:#0d0d0d;border-color:var(--line-2)}
+
+/* documents, rules, about */
+.doclist a{border-radius:0;border-left:1px solid transparent}
+.doclist a.on{background:#ffffff0a;border-left-color:#f2f2f2}
+.doclist a:hover{background:#ffffff08}
+.doclist .id{font-family:var(--mono)}
+.docbody h1{font-family:var(--display);font-stretch:112%;font-weight:560;text-transform:uppercase;letter-spacing:-.01em;font-size:22px}
+.step{background:transparent;border:1px solid var(--line);border-radius:0}
+.step .n{color:#c8c8c8;letter-spacing:.08em}
+.step h3{font-family:var(--display);font-stretch:112%;font-weight:560;text-transform:uppercase;letter-spacing:-.01em;font-size:18px}
+.step p{font-size:14.5px}
+.ladder,.pipe{gap:0}
+.ladder .step + .step,.pipe .step + .step{border-left:0}
+.empty h2{font-family:var(--display);font-stretch:112%;font-weight:560;text-transform:uppercase}
+.inst-seg button{font-size:12.5px}
+@media (max-width:1100px){.side{gap:16px;padding:0 20px;overflow-x:auto}.side-foot .lbl{display:none}.page{padding:32px 20px 64px}.ladder .step + .step,.pipe .step + .step{border-left:1px solid var(--line)}}
