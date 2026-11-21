@@ -1,0 +1,2065 @@
+#!/usr/bin/env python3
+"""Deterministic transaction-monitoring alert triage.
+
+usage: run <institution_folder> <output.jsonl> [--trace]
+
+Reads only the given institution folder. Writes only the output file and,
+with --trace, <output>.trace.jsonl (a per-case knowledge graph + proof trace).
+No network, no randomness, no LLM: identical inputs give byte-identical outputs.
+"""
+import json, os, re, sys
+from datetime import date, datetime, timedelta
+
+# ----------------------------------------------------------------------------
+# Policy configuration (from each POLICY.md)
+# ----------------------------------------------------------------------------
+HIGH_RISK = {"afghanistan", "belarus", "democratic republic of the congo", "haiti", "iran", "iraq",
+             "lebanon", "libya", "mali", "myanmar", "north korea", "russia", "somalia", "south sudan",
+             "syria", "venezuela", "yemen"}
+OWN_ACCOUNT_RFI_MULTIPLE = 5.0           # all four SOPs
+POLICY = {
+    "bank":        {"tm02_min": 2000.0, "invoice_required_gbp": None},
+    "emoney":      {"tm02_min": 2000.0, "invoice_required_gbp": None},
+    "investment":  {"tm02_min": 2000.0, "invoice_required_gbp": None},
+    "payments_fx": {"tm02_min": 2000.0, "invoice_required_gbp": 10000.0},
+}
+BOILERPLATE = {"due_diligence_summary", "proof_of_address", "contact_note"}
+VERDICT_OF = {
+    "COLLECTION_DOCUMENTED": "CLOSE", "BUSINESS_RECORDS_RECONCILE": "CLOSE", "DOCUMENTED_EVENT": "CLOSE",
+    "INVOICE_MATCHES": "CLOSE", "OWN_ACCOUNT": "CLOSE", "GROUP_COMPANY": "CLOSE",
+    "THIRD_PARTY_DOCUMENTED": "CLOSE", "REFUND_OF_EARLIER_PAYMENT": "CLOSE", "RETURNING_CUSTOMER": "CLOSE",
+    "LIST_MATCH_DIFFERENT_PARTY": "CLOSE", "WITHIN_PROFILE": "CLOSE",
+    "RFI_PURPOSE_DOCUMENTS": "RFI", "RFI_BUSINESS_RECORDS": "RFI", "RFI_SOURCE_OF_FUNDS": "RFI",
+    "RFI_COUNTERPARTY_DETAILS": "RFI", "RFI_UPDATED_PROFILE": "RFI",
+    "ESC_MULE_ACTIVITY": "ESCALATE", "ESC_STRUCTURING": "ESCALATE", "ESC_UNEXPLAINED_FUNDS": "ESCALATE",
+    "ESC_PASS_THROUGH": "ESCALATE", "ESC_INVOICE_MISMATCH": "ESCALATE", "ESC_HIGH_RISK_CORRIDOR": "ESCALATE",
+    "ESC_ACCOUNT_MISUSE": "ESCALATE", "ESC_THIRD_PARTY_FUNDING": "ESCALATE", "ESC_EARLY_REDEMPTION": "ESCALATE",
+    "ESC_LISTED_PARTY": "ESCALATE",
+}
+# Which close ground leads when several explain the case (most specific first)
+CLOSE_PRIORITY = ["LIST_MATCH_DIFFERENT_PARTY", "RETURNING_CUSTOMER", "COLLECTION_DOCUMENTED",
+                  "BUSINESS_RECORDS_RECONCILE", "GROUP_COMPANY", "REFUND_OF_EARLIER_PAYMENT", "DOCUMENTED_EVENT",
+                  "INVOICE_MATCHES", "THIRD_PARTY_DOCUMENTED", "OWN_ACCOUNT", "WITHIN_PROFILE"]
+# Document type -> close ground when its amounts reconcile to a transaction
+EXPLAIN_TYPES = {
+    "solicitor_letter": "DOCUMENTED_EVENT", "insurer_letter": "DOCUMENTED_EVENT",
+    "settlement_letter": "DOCUMENTED_EVENT", "completion_statement": "DOCUMENTED_EVENT",
+    "vehicle_sale_receipt": "DOCUMENTED_EVENT", "sale_receipt": "DOCUMENTED_EVENT",
+    "deposit_return_letter": "DOCUMENTED_EVENT", "holding_deposit_receipt": "DOCUMENTED_EVENT",
+    "loan_agreement": "DOCUMENTED_EVENT", "redundancy_letter": "DOCUMENTED_EVENT",
+    "dealer_invoice": "INVOICE_MATCHES", "hospital_invoice": "INVOICE_MATCHES", "invoice": "INVOICE_MATCHES",
+    "supplier_invoice": "INVOICE_MATCHES", "receipt": "INVOICE_MATCHES", "contract_schedule": "INVOICE_MATCHES",
+    "venue_email": "REFUND_OF_EARLIER_PAYMENT", "credit_note": "REFUND_OF_EARLIER_PAYMENT",
+    "cancellation_confirmation": "REFUND_OF_EARLIER_PAYMENT",
+    "gift_letter": "THIRD_PARTY_DOCUMENTED",
+    "cash_collection_reports": "BUSINESS_RECORDS_RECONCILE", "cash_reconciliation": "BUSINESS_RECORDS_RECONCILE",
+    "takings_book": "BUSINESS_RECORDS_RECONCILE", "freight_invoices": "BUSINESS_RECORDS_RECONCILE",
+    "carrier_invoice": "BUSINESS_RECORDS_RECONCILE", "payment_file": "BUSINESS_RECORDS_RECONCILE",
+}
+INVOICE_LIKE = {"invoice", "supplier_invoice", "supplier_invoices", "dealer_invoice", "hospital_invoice",
+                "carrier_invoice", "freight_invoices", "contract_schedule", "supply_contract", "consulting_contract",
+                "purchase_order", "payment_file", "receipt", "credit_note"}
+SUSPICION_WORDS = re.compile(r"\b(scam|fraud|freeze|mule|launder\w*|crypto)\b", re.I)
+GENERIC_TOKENS = {"ltd", "llp", "plc", "limited", "the", "and", "of", "client", "account", "co", "company", "group",
+                  "holdings", "estate", "payment", "transfer", "from", "to", "for", "bank", "refund", "booking",
+                  "inv", "ref", "sal", "srl", "fze", "bv", "gmbh", "trading", "services", "solicitors", "card",
+                  "settlement", "agreement", "deposit", "loan", "advance", "funding", "top", "up"}
+MONTHS = {m: i for i, m in enumerate(["january", "february", "march", "april", "may", "june", "july", "august",
+                                       "september", "october", "november", "december"], 1)}
+
+# ----------------------------------------------------------------------------
+# Parsing helpers
+# ----------------------------------------------------------------------------
+# Pound amounts: "£1,234.56", "GBP 1234.56", "1,234.56 GBP", "1,234 pounds".
+MONEY_RE = re.compile(r"(?:£|\bGBP)\s?(\d[\d,]*(?:\.\d{1,2})?)|\b(\d[\d,]*(?:\.\d{1,2})?)\s?(?:GBP|pounds?)\b", re.I)
+CUR = r"(?:£|\bGBP\s?)"  # currency marker used inside threshold-talk patterns
+# One shared date grammar: "12 August 2026", "12th Aug 2026", "August 12, 2026", "2026-08-12", "12/08/2026" (UK d/m).
+_MON = (r"(?:January|February|March|April|May|June|July|August|September|October|November|December|"
+        r"Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec)\.?")
+DATE_RE = re.compile(r"\b(?:(?P<d1>\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?(?P<m1>" + _MON + r"),?\s+(?P<y1>\d{4})"
+                     r"|(?P<m2>" + _MON + r")\s+(?P<d2>\d{1,2})(?:st|nd|rd|th)?,?\s+(?P<y2>\d{4})"
+                     r"|(?P<y3>\d{4})-(?P<m3>\d{1,2})-(?P<d3>\d{1,2})"
+                     r"|(?P<d4>\d{1,2})/(?P<m4>\d{1,2})/(?P<y4>\d{4}))\b", re.I)
+MONTH_YEAR_RE = re.compile(r"\b(?P<m>" + _MON + r")\s+(?P<y>\d{4})\b|\b(?P<y2>\d{4})-(?P<m2>\d{1,2})\b", re.I)
+
+
+def money(s):
+    out = []
+    for mm in MONEY_RE.finditer(s or ""):
+        m = mm.group(1) or mm.group(2)
+        try:
+            out.append(round(float(m.replace(",", "")), 2))
+        except ValueError:
+            pass
+    return out
+
+
+def fmt(x):
+    return "£{:,.2f}".format(x)
+
+
+def month_num(m):
+    """'August' / 'Aug' / 'Sept.' / '8' -> 8."""
+    m = str(m).lower().rstrip(".")
+    if m.isdigit():
+        return int(m)
+    for k, v in MONTHS.items():
+        if k.startswith(m[:3]):
+            return v
+    return None
+
+
+def match_date(m):
+    """Date from a DATE_RE match (None if the numbers are not a real date)."""
+    g = m.groupdict()
+    for i in "1234":
+        if g.get("y" + i):
+            try:
+                return date(int(g["y" + i]), month_num(g["m" + i]), int(g["d" + i]))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def pdate(s):
+    """Parse the first real date in s ('12 August 2026', 'Aug 12, 2026', ISO '2026-08-12...', '12/08/2026')."""
+    if not s:
+        return None
+    s = str(s)
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    for m in DATE_RE.finditer(s):
+        d = match_date(m)
+        if d:
+            return d
+    return None
+
+
+def month_year(s):
+    """(month, year) stated in s: a full date, 'February 1959', 'Feb 1959' or '1959-02'."""
+    d = pdate(s)
+    if d:
+        return d.month, d.year
+    m = MONTH_YEAR_RE.search(s or "")
+    if not m:
+        return None
+    mo = month_num(m.group("m") or m.group("m2"))
+    return (mo, int(m.group("y") or m.group("y2"))) if mo and 1 <= mo <= 12 else None
+
+
+def dtxt(d):
+    return "{} {} {}".format(d.day, [k for k, v in MONTHS.items() if v == d.month][0].capitalize(), d.year) if d else "?"
+
+
+def norm(s):
+    s = (s or "").lower()
+    s = re.sub(r"[^a-z0-9& ]+", " ", s)
+    if "limited" in s:
+        s = re.sub(r"\blimited\b", "ltd", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def tokens(s):
+    return [t for t in norm(s).split() if len(t) >= 4 and t not in GENERIC_TOKENS and not t.isdigit()]
+
+
+def acct_key(s):
+    """Normalise an account reference to its last 4 digits ('IBAN ending 5416', '96-25-05 28236724')."""
+    if not s:
+        return None
+    d = re.findall(r"\d+", str(s))
+    if not d:
+        return None
+    return d[-1][-4:]
+
+
+def surname(name):
+    p = norm(name).split()
+    return p[-1] if p else ""
+
+
+# Alternative field labels -> the label the rules read (only filled when the canonical label is absent).
+FIELD_ALIASES = {"remit to": "pay to", "payee": "pay to", "beneficiary": "pay to", "pay": "pay to",
+                 "total": "amount", "invoice total": "amount", "total due": "amount due", "balance due": "amount due",
+                 "amount payable": "amount due",
+                 "date of incorporation": "incorporated", "incorporated on": "incorporated"}
+
+
+def parse_fields(text):
+    f = {}
+    for m in re.finditer(r"^\*\*([^*]+?):\*\*\s*(.*)$", text, re.M):
+        k = m.group(1).strip().lower()
+        if k not in f:
+            f[k] = m.group(2).strip()
+    for k, canon in FIELD_ALIASES.items():
+        if k in f and canon not in f:
+            f[canon] = f[k]
+    return f
+
+
+def parse_tables(text):
+    tables, cur, header = [], None, None
+    for line in text.split("\n"):
+        line = line.strip()
+        if line.startswith("|") and line.endswith("|"):
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if header is None:
+                header, cur = [c.lower() for c in cells], []
+            elif all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
+                continue
+            else:
+                row = {header[i] if i < len(header) else str(i): cells[i] for i in range(len(cells))}
+                cur.append(row)
+        else:
+            if header is not None:
+                tables.append(cur)
+            header, cur = None, None
+    if header is not None:
+        tables.append(cur)
+    return tables
+
+
+# ----------------------------------------------------------------------------
+# Normalisation layer
+# Every evidence document, and every free-text string in the jsonl inputs, goes through normalise() before
+# any rule reads it. Each step is a fixed, ordered table, so the output is deterministic. Text that is
+# already canonical comes back unchanged, so canonical inputs give byte-identical results.
+#   1. characters : non-breaking/thin spaces -> space; curly double quotes -> "; en/em dash -> -
+#   2. whitespace : tabs and runs of spaces inside a line -> one space; lines broken mid-sentence are rejoined
+#   3. money      : "GBP 9680.13", "9,680.13 GBP", "9680.13 pounds", "£ 9680.13"  -> "£9,680.13"
+#   4. dates      : "2026-09-14", "14/09/2026", "14-09-2026", "14.09.2026" (UK day-first), "September 14, 2026",
+#                   "14th Sep 2026", "14th of September 2026"                     -> "14 September 2026"
+#   5. labels     : field labels "**Remit to:**", "**Payee:**", "**Balance due:**", "**Name on account:**" ...
+#                   -> the label the rules read (FIELD_LABEL_SYNONYMS)
+#                   abbreviated label/table-header words "Acct", "No.", "Ref.", "Dir.", "Co." -> full words
+#                   (LABEL_ABBREVIATIONS)
+#   6. entities   : company legal forms "Limited", "Ltd.", "LIMITED", "P.L.C." -> "Ltd", "plc" (ENTITY_FORMS)
+#   7. phrases    : wording synonyms -> the wording the rules read (PHRASE_SYNONYMS)
+# ----------------------------------------------------------------------------
+_MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+                "November", "December"]
+_NMON = (r"(?:January|February|March|April|May|June|July|August|September|October|November|December|"
+         r"Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec)\.?")
+CHAR_MAP = [("\u00a0", " "), ("\u2007", " "), ("\u202f", " "), ("\u2009", " "), ("\t", " "),
+            ("\u201c", '"'), ("\u201d", '"'), ("\u2013", "-"), ("\u2014", "-")]
+FIELD_LABEL_SYNONYMS = [  # (label as written, canonical label)
+    ("remit to", "Pay to"), ("payee", "Pay to"), ("pay", "Pay to"), ("payable to", "Pay to"),
+    ("balance due", "Amount due"), ("total due", "Amount due"), ("amount payable", "Amount due"),
+    ("names on account", "Account holders"), ("name on account", "Account holder"), ("account holder names", "Account holders"),
+    ("account in the name of", "Account holder"),
+    ("name of account holder", "Account holder"),
+    ("date of incorporation", "Incorporated"), ("incorporated on", "Incorporated"),
+    ("dob", "Date of birth"), ("born", "Date of birth"),
+]
+LABEL_ABBREVIATIONS = [  # abbreviated words inside field labels -> full word (applied before FIELD_LABEL_SYNONYMS)
+    (r"\bacct\.?(?=[\s:]|$)", "account"), (r"\bno\.(?=[\s:]|$)", "number"), (r"\bref\.?(?=[\s:]|$)", "reference"),
+    (r"\bdir\.(?=[\s:]|$)", "director"), (r"\bco\.(?=[\s:]|$)", "company"),
+]
+ENTITY_FORMS = [  # legal-form spellings of company names -> the form used in the transaction data
+    (r"(?<=[A-Za-z.]) (?:Limited|LIMITED|Ltd\.|LTD\.?)(?=[\s,.;:)'\u2019]|$)", " Ltd"),
+    (r"(?<=[A-Za-z]) (?:Public Limited Company|P\.L\.C\.|PLC)(?=[\s,.;:)]|$)", " plc"),
+    (r"(?<=[A-Za-z]) (?:Limited Liability Partnership|L\.L\.P\.)(?=[\s,.;:)]|$)", " LLP"),
+]
+PHRASE_SYNONYMS = [  # (regex, canonical wording); matched case-insensitively, first letter's case kept
+    (r"\bin the name of\b", "held by"),
+    (r"\bstepped down\b", "resigned"),
+    (r"\bacct\.?(?= )", "account"),
+    (r"\bceased to be (?:a )?director\b", "resigned as director"),
+    (r"\b(\d+(?:\.\d+)?) ?(?:per ?cent|percent|pct)\b", r"\1%"),
+]
+_DATE_FIXES = [
+    (re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b"), "ymd"),
+    (re.compile(r"\b(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})\b"), "dmy"),
+    (re.compile(r"\b(" + _NMON + r")\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b", re.I), "mdy"),
+    (re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?(" + _NMON + r"),?\s+(\d{4})\b", re.I), "dMy"),
+    (re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)\s+(?:of\s+)?(" + _NMON + r")(?![a-z])", re.I), "dM"),
+]
+
+
+def _month(tok):
+    t = str(tok).lower().rstrip(".")
+    if t.isdigit():
+        n = int(t)
+        return _MONTH_NAMES[n - 1] if 1 <= n <= 12 else None
+    for m in _MONTH_NAMES:
+        if m.lower().startswith(t[:3]):
+            return m
+    return None
+
+
+def _date_sub(kind):
+    def f(m):
+        g = m.groups()
+        if kind == "ymd":
+            y, mo, d = g
+        elif kind == "dmy":
+            d, mo, y = g
+        elif kind == "mdy":
+            mo, d, y = g
+        elif kind == "dMy":
+            d, mo, y = g
+        else:
+            d, mo, y = g[0], g[1], None
+        name = _month(mo)
+        try:
+            if not name or not 1 <= int(d) <= 31 or (y and date(int(y), _MONTH_NAMES.index(name) + 1, int(d)) is None):
+                return m.group(0)
+        except ValueError:
+            return m.group(0)
+        return "%d %s %s" % (int(d), name, y) if y else "%d %s" % (int(d), name)
+    return f
+
+
+def _canon_amount(num):
+    num = num.replace(",", "")
+    ip, _, dp = num.partition(".")
+    if not ip.isdigit():
+        return None
+    return "£" + "{:,}".format(int(ip)) + ("." + dp if dp else "")
+
+
+def _money_sub(m):
+    c = _canon_amount(m.group(1))
+    return c if c else m.group(0)
+
+
+_MONEY_FIXES = [
+    re.compile(r"(?<![\w£])(\d[\d,]*(?:\.\d{1,2})?)\s?(?:GBP|pounds sterling|pounds|pound|sterling)\b", re.I),
+    re.compile(r"\b(?:GBP|STG|sterling)\s?£?\s?(\d[\d,]*(?:\.\d{1,2})?)(?![\d])", re.I),
+    re.compile(r"£\s?(\d[\d,]*(?:\.\d{1,2})?)(?![\d])"),
+]
+_BLOCK_START = re.compile(r"^\s*(?:\||#|\*\*|[-*+] |\d+[.)] |>)")
+
+
+def _keep_case(repl):
+    def f(m):
+        r = m.expand(repl)
+        return r[:1].upper() + r[1:] if m.group(0)[:1].isupper() else r
+    return f
+
+
+_LABEL_ABBR_RX = [(re.compile(rx, re.I), full) for rx, full in LABEL_ABBREVIATIONS]
+_ENTITY_RX = [(re.compile(rx), repl) for rx, repl in ENTITY_FORMS]
+_FIELD_SYN = {src: canon for src, canon in FIELD_LABEL_SYNONYMS}
+_FIELD_SYN_RX = re.compile(r"^\*\*(" + "|".join(re.escape(k) for k, _ in FIELD_LABEL_SYNONYMS) + r"):\*\*", re.M | re.I)
+_PHRASE_RX = [(re.compile(rx, re.I), _keep_case(repl)) for rx, repl in PHRASE_SYNONYMS]
+_DATE_RX = [(rx, _date_sub(kind)) for rx, kind in _DATE_FIXES]
+_SPACES_RX = re.compile(r"(?<=\S) {2,}(?=\S)")
+_LINE_END_RX = re.compile(r"[.!?:;|\")\u2019]$")
+_FIELD_LABEL_RX = re.compile(r"^\*\*([^*\n]+?):\*\*", re.M)
+_TABLE_HEAD_RX = re.compile(r"^(\|.*\|)[ ]*\n(?=\|[\s:|-]*-{3,}[\s:|-]*\|?[ ]*$)", re.M)
+_RAW_SPECIAL_RX = re.compile("[\u00a0\u2007\u202f\u2009\t\u201c\u201d\u2013\u2014]|\\\\u(?:00a0|2007|202f|2009|201c|201d|2013|2014)|\\\\t|  ")
+
+
+_RAW_SPECIALS = ("\u00a0", "\u2007", "\u202f", "\u2009", "\t", "\u201c", "\u201d", "\u2013", "\u2014", "\\u00a0",
+                 "\\u2007", "\\u202f", "\\u2009", "\\u201c", "\\u201d", "\\u2013", "\\u2014", "\\t", "  ")
+_MONEY_HINTS = ("gbp", "pound", "sterling", "stg", "£ ")
+
+
+def _expand_label(lbl):
+    low = lbl.lower()
+    if "." not in lbl and "acct" not in low and "ref" not in low:
+        return lbl
+    new = lbl
+    for rx, full in _LABEL_ABBR_RX:
+        new = rx.sub(full, new)
+    if new == lbl:
+        return lbl
+    return new[:1].upper() + new[1:]
+
+
+def normalise(text):
+    """Canonicalise free text before the rules read it (see the table above). Idempotent and deterministic."""
+    if not text:
+        return text
+    for a, b in CHAR_MAP:
+        text = text.replace(a, b)
+    lines = [_SPACES_RX.sub(" ", ln.rstrip()) if "  " in ln else ln.rstrip() for ln in text.split("\n")]
+    out = []
+    for ln in lines:
+        if (out and out[-1].strip() and ln.strip() and ln.lstrip()[:1].islower() and not _BLOCK_START.match(ln)
+                and not _BLOCK_START.match(out[-1]) and not _LINE_END_RX.search(out[-1])):
+            out[-1] = out[-1] + " " + ln.strip()
+        else:
+            out.append(ln)
+    text = "\n".join(out)
+    low = text.lower()
+    for i, rx in enumerate(_MONEY_FIXES):
+        if i < 2 and not any(h in low for h in _MONEY_HINTS):
+            continue
+        text = rx.sub(_money_sub, text)
+    for rx, fn in _DATE_RX:
+        text = rx.sub(fn, text)
+    text = _FIELD_LABEL_RX.sub(lambda m: "**%s:**" % _expand_label(m.group(1)), text)
+    text = _TABLE_HEAD_RX.sub(  # markdown table header row
+        lambda m: "|".join(c.replace(c.strip(), _expand_label(c.strip())) if c.strip() else c
+                           for c in m.group(1).split("|")) + "\n", text)
+    for rx, repl in _ENTITY_RX:
+        text = rx.sub(repl, text)
+    text = _FIELD_SYN_RX.sub(lambda m: "**%s:**" % _FIELD_SYN[m.group(1).lower()], text)
+    for rx, fn in _PHRASE_RX:
+        text = rx.sub(fn, text)
+    return text
+
+
+def normalise_record(rec):
+    """Light normalisation for jsonl string values (characters and whitespace only; ids and amounts untouched)."""
+    if isinstance(rec, dict):
+        return {k: normalise_record(v) for k, v in rec.items()}
+    if isinstance(rec, list):
+        return [normalise_record(v) for v in rec]
+    if isinstance(rec, str):
+        for a, b in CHAR_MAP:
+            rec = rec.replace(a, b)
+        return re.sub(r" {2,}", " ", rec).strip() if "  " in rec or rec != rec.strip() else rec
+    return rec
+
+
+class Doc(object):
+    def __init__(self, meta, text):
+        self.id = meta["doc_id"]
+        self.type = meta.get("type") or ""
+        self.title = meta.get("title") or ""
+        self.dated = pdate(meta.get("dated"))
+        text = normalise(text)
+        self.text = text
+        self.body = re.sub(r"^# .*$|^\*\*Document ID:\*\*.*$|^\*\*Dated:\*\*.*$", "", text, flags=re.M)
+        self.fields = parse_fields(text)
+        self.tables = parse_tables(text)
+        self.amounts = money(self.body)
+        self.ntext = norm(self.title + " " + self.body)
+
+
+# ----------------------------------------------------------------------------
+# Loading (only from the given institution folder)
+# ----------------------------------------------------------------------------
+def read_jsonl(path):
+    out = []
+    if not os.path.exists(path):
+        return out
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                rec = json.loads(line)
+                special = not line.replace("£", "").replace("\u2019", "").isascii() or "\\u" in line or "\\t" in line or "  " in line
+                out.append(normalise_record(rec) if special and any(c in line for c in _RAW_SPECIALS) else rec)
+    return out
+
+
+class World(object):
+    def __init__(self, folder):
+        self.folder = folder
+        self.inst = os.path.basename(os.path.normpath(folder))
+        self.cases = read_jsonl(os.path.join(folder, "cases.jsonl"))
+        inst = [c.get("institution") for c in self.cases if c.get("institution") in POLICY]
+        if inst:
+            self.inst = inst[0]
+        else:
+            for k in POLICY:
+                if k in folder.lower():
+                    self.inst = k
+        self.alerts = {a["alert_id"]: a for a in read_jsonl(os.path.join(folder, "alerts.jsonl"))}
+        self.customers = {c["customer_id"]: c for c in read_jsonl(os.path.join(folder, "customers.jsonl"))}
+        self.txns, self.txns_by_cust = {}, {}
+        for t in read_jsonl(os.path.join(folder, "transactions.jsonl")):
+            self.txns[t["transaction_id"]] = t
+            self.txns_by_cust.setdefault(t["customer_id"], []).append(t)
+        for v in self.txns_by_cust.values():
+            v.sort(key=lambda t: (t.get("booked_at") or "", t["transaction_id"]))
+        self.docs_meta = {}
+        for e in read_jsonl(os.path.join(folder, "evidence.jsonl")):
+            self.docs_meta.setdefault(e["customer_id"], []).append(e)
+        self.reviews = {}
+        for r in read_jsonl(os.path.join(folder, "previous_reviews.jsonl")):
+            self.reviews.setdefault(r["customer_id"], []).append(r)
+        self.listed = {r["entry_id"]: r for r in read_jsonl(os.path.join(folder, "internal_list.jsonl"))}
+
+    def docs_for(self, cid):
+        out = []
+        for m in sorted(self.docs_meta.get(cid, []), key=lambda e: e["doc_id"]):
+            p = os.path.join(self.folder, m.get("file") or ("evidence/%s.md" % m["doc_id"]))
+            try:
+                with open(p, encoding="utf-8") as fh:
+                    txt = fh.read()
+            except OSError:
+                txt = ""
+            out.append(Doc(m, txt))
+        return out
+
+
+# ----------------------------------------------------------------------------
+# Case context, facts and proof trace
+# ----------------------------------------------------------------------------
+class Case(object):
+    def __init__(self, world, case):
+        self.w = world
+        self.inst = world.inst
+        self.pol = POLICY.get(world.inst, POLICY["bank"])
+        self.c = case
+        self.id = case["case_id"]
+        self.cust = world.customers.get(case["customer_id"], {"customer_id": case["customer_id"], "name": "",
+                                                               "declared": {}, "kind": "individual"})
+        self.cname = self.cust.get("name") or ""
+        self.alerts = [world.alerts[a] for a in case.get("alert_ids", []) if a in world.alerts]
+        self.rules = sorted(set(a["rule_id"] for a in self.alerts))
+        self.all_txns = world.txns_by_cust.get(case["customer_id"], [])
+        self.tx = {t["transaction_id"]: t for t in self.all_txns}
+        self.alerted = []
+        for a in self.alerts:
+            for t in a.get("transaction_ids", []):
+                if t in self.tx and t not in self.alerted:
+                    self.alerted.append(t)
+        self.held = case.get("held_payment_id")
+        rw = case.get("review_window") or {}
+        self.wfrom, self.wto = pdate(rw.get("from")), pdate(rw.get("to"))
+        self.docs = world.docs_for(case["customer_id"])
+        self.sig_docs = [d for d in self.docs if d.type not in BOILERPLATE]
+        self.reviews = sorted(world.reviews.get(case["customer_id"], []), key=lambda r: r["review_id"])
+        self.valid_ids = set([self.id] + [a["alert_id"] for a in self.alerts] + list(self.tx) + [d.id for d in self.docs]
+                             + [r["review_id"] for r in self.reviews] + [case["customer_id"]])
+        self.list_entries = {}
+        for a in self.alerts:
+            le = (a.get("measured") or {}).get("list_entry")
+            if le and le in world.listed:
+                self.list_entries[le] = world.listed[le]
+                self.valid_ids.add(le)
+        # proof trace
+        self.facts, self.firings, self.edges = [], [], []
+
+    # --- trace helpers -----------------------------------------------------
+    def fact(self, kind, sources, **val):
+        f = {"id": "F%d" % (len(self.facts) + 1), "kind": kind, "sources": sorted(set(s for s in sources if s))}
+        f.update(val)
+        self.facts.append(f)
+        return f["id"]
+
+    def edge(self, src, dst, rel):
+        e = (src, dst, rel)
+        if src and dst and e not in self.edges:
+            self.edges.append(e)
+
+    def fire(self, rule, outcome, facts, **extra):
+        r = {"rule": rule, "outcome": outcome, "facts": list(facts)}
+        r.update(extra)
+        self.firings.append(r)
+
+    # --- convenience ---------------------------------------------------------
+    def of_type(self, *types):
+        return [d for d in self.sig_docs if d.type in types]
+
+    def alerts_of(self, rule):
+        return [a for a in self.alerts if a["rule_id"] == rule]
+
+    def t(self, tid):
+        return self.tx.get(tid)
+
+    def window_txns(self, before_days=45):
+        lo = (self.wfrom - timedelta(days=before_days)) if self.wfrom else None
+        out = []
+        for t in self.all_txns:
+            d = pdate(t.get("booked_at"))
+            if lo and d and d < lo:
+                continue
+            if self.wto and d and d > self.wto + timedelta(days=1):
+                continue
+            out.append(t)
+        return out
+
+    def is_self(self, name):
+        return bool(name) and norm(name) == norm(self.cname)
+
+    def profile_explained(self, t):
+        """Activity the declared profile itself explains: salary from the declared employer, card-acquirer
+        settlements for a business, and small own-name top-ups."""
+        ref = (t.get("reference") or "").upper()
+        cp = t.get("counterparty_name") or ""
+        emp = self.cust.get("employer") or ""
+        if t["direction"] == "in" and (ref.startswith("SALARY") or (emp and norm(cp) == norm(emp))):
+            return "salary from declared employer"
+        if t["direction"] == "in" and ref == "CARD SETTLEMENT" and self.cust.get("kind") == "business":
+            return "card takings settlement"
+        if t["direction"] == "in" and self.is_self(cp) and not t.get("counterparty_account") and t["amount_gbp"] < 1000:
+            return "small own-name top-up"
+        if self.inst == "payments_fx" and t["direction"] == "in" and self.is_self(cp):
+            return "funding from the client's own account (a declared payment method)"
+        if ref == "MONTHLY CONTRIBUTION" and t["amount_gbp"] < 2500:
+            return "regular monthly contribution"
+        return None
+
+
+def party_match(t, d):
+    """Does document d refer to transaction t's counterparty (name/reference tokens or account digits)?"""
+    if (t.get("channel") or "").startswith("cash"):
+        return True
+    toks = tokens((t.get("counterparty_name") or "") + " " + (t.get("reference") or ""))
+    if any(re.search(r"\b%s\b" % re.escape(x), d.ntext) for x in toks):
+        return True
+    k = acct_key(t.get("counterparty_account"))
+    if k and re.search(r"\b\d*%s\b" % k, d.body):
+        return True
+    return False
+
+
+def amount_in(t, d, tol=0.01):
+    for a in d.amounts:
+        if abs(a - t["amount_gbp"]) <= tol or (t.get("amount") is not None and abs(a - t["amount"]) <= tol
+                                                and (t.get("currency") or "GBP") == "GBP"):
+            return True
+    return False
+
+
+# ----------------------------------------------------------------------------
+# Suspicion rules (any one -> ESCALATE). Each returns a Finding or None.
+# ----------------------------------------------------------------------------
+class Finding(object):
+    def __init__(self, code, rule, reason, evidence, facts=()):
+        self.code, self.rule, self.reason, self.evidence, self.facts = code, rule, reason, list(evidence), list(facts)
+
+
+def in_txns(cs, ids=None):
+    ids = ids if ids is not None else cs.alerted
+    return [cs.t(i) for i in ids if cs.t(i) and cs.t(i)["direction"] == "in"]
+
+
+def out_txns(cs, ids=None):
+    ids = ids if ids is not None else cs.alerted
+    return [cs.t(i) for i in ids if cs.t(i) and cs.t(i)["direction"] == "out"]
+
+
+def s_fraud_reports(cs):
+    reps = cs.of_type("sending_bank_fraud_report")
+    hits, tids, fids = [], [], []
+    for d in reps:
+        m = re.search(r"(?:our customer|customer,?)\s+([A-Z][a-z]+(?: [A-Z][a-z'-]+)+)\s+(?:sent|paid|transferred)", d.body)
+        sender = m.group(1) if m else None
+        for t in cs.window_txns():
+            if t["direction"] == "in" and sender and norm(t.get("counterparty_name")) == norm(sender):
+                hits.append(d.id); tids.append(t["transaction_id"])
+                fids.append(cs.fact("scam_report_sender_paid_customer", [d.id, t["transaction_id"]], sender=sender,
+                                    amount=t["amount_gbp"]))
+                cs.edge(d.id, t["transaction_id"], "contradicts")
+                break
+    if not hits:
+        return None
+    senders = sorted(set(cs.t(t)["counterparty_name"] for t in tids))
+    total = sum(cs.t(t)["amount_gbp"] for t in tids)
+    outs = [t for t in out_txns(cs) if not cs.profile_explained(t) and t["amount_gbp"] >= 500]
+    onward = (" The money was moved straight on, e.g. %s to %s on %s." % (
+        fmt(outs[0]["amount_gbp"]), outs[0]["counterparty_name"], dtxt(pdate(outs[0]["booked_at"])))) if outs else " The funds have no credible source."
+    reason = ("%d sending banks report authorised push payment scams on payments into this account (%s) from %s, "
+              "totalling %s.%s The account is receiving and passing on victims' money, which is mule activity." % (
+                  len(set(hits)), ", ".join(sorted(set(hits))), ", ".join(senders), fmt(total), onward))
+    ev = sorted(set(hits)) + tids + [t["transaction_id"] for t in outs[:3]]
+    ev += [d.id for d in cs.of_type("device_export", "support_chat")]
+    return Finding("ESC_MULE_ACTIVITY", "S1_scam_reports", reason, ev, fids)
+
+
+MULE_CHAT = re.compile(r"payments? assistant|crypto account|(?:keep|keeping|retain|retaining|take|taking) (?:\d+|a|an?\s\w+)\s?(?:%|per ?cent\b|percent\b|cut\b)|send it on to the company|their clients pay",
+                       re.I)
+THIRD_PARTY_INVEST = re.compile(r"(friends?|cousins?|people|relatives?|others?)\b[^.]{0,80}\binvest|"
+                                r"invest(?:ing)?\b[^.]{0,40}\b(for|through) (them|a few people|people|mine|others)|"
+                                r"invest for (a few |some )?(people|friends|others)", re.I)
+
+
+def chats(cs):
+    return cs.of_type("support_chat")
+
+
+def first_sentence(text, cap=110):
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    m = re.match(r"(.+?[.!?])(\s|$)", t)
+    t = m.group(1) if m else t
+    return t if len(t) <= cap else t[:cap].rsplit(" ", 1)[0] + "..."
+
+
+def customer_lines(d):
+    return " ".join(m.group(1) for m in re.finditer(r"^\W*Customer\W*?:\W*\s*(.*)$", d.text, re.M))
+
+
+def s_mule_chat(cs):
+    for d in chats(cs):
+        if MULE_CHAT.search(customer_lines(d)):
+            fid = cs.fact("customer_describes_money_mule_role", [d.id], quote=MULE_CHAT.search(customer_lines(d)).group(0))
+            ins = [t for t in in_txns(cs) if not cs.profile_explained(t)]
+            reason = ("In %s the customer says they receive other people's money and send it on for a remote 'employer' "
+                      "(\"%s\"). %d third-party payments totalling %s came in during the window and were paid out. "
+                      "This is money-mule activity." % (d.id, MULE_CHAT.search(customer_lines(d)).group(0),
+                                                        len(ins), fmt(sum(t["amount_gbp"] for t in ins))))
+            return Finding("ESC_MULE_ACTIVITY", "S2_mule_role_chat", reason, [d.id] + [t["transaction_id"] for t in ins[:6]],
+                           [fid])
+    return None
+
+
+def s_third_party_investing(cs):
+    if cs.inst != "investment" and "TM08" not in cs.rules:
+        return None
+    for d in chats(cs):
+        cl = customer_lines(d)
+        if THIRD_PARTY_INVEST.search(cl):
+            fid = cs.fact("customer_invests_for_third_parties", [d.id], quote=cl[:160])
+            tm08 = cs.alerts_of("TM08")
+            tm10 = cs.alerts_of("TM10")
+            flows = [cs.t(t) for a in tm08 for t in a["transaction_ids"] if cs.t(t)]
+            fl = "; ".join("%s %s %s" % (fmt(t["amount_gbp"]), "from" if t["direction"] == "in" else "to",
+                                         t["counterparty_name"]) for t in flows[:3])
+            ev = [d.id] + [t["transaction_id"] for t in flows]
+            if tm10:
+                m = tm10[0]["measured"]
+                ev += tm10[0]["transaction_ids"]
+                reason = ("Units in %s bought for %s were sold back after %s days for %s and paid to a third party (%s). "
+                          "In %s the customer says they invest for other people, so the platform is being used to move "
+                          "money for others through quick fund round trips." % (
+                              m.get("fund"), fmt(m.get("bought_gbp", 0)), m.get("held_days"), fmt(m.get("redeemed_gbp", 0)),
+                              fl or "see alert", d.id))
+                return Finding("ESC_EARLY_REDEMPTION", "S3_third_party_investing", reason, ev, [fid])
+            reason = ("Third parties fund or receive money from this account (%s). In %s the customer says the money "
+                      "belongs to other people (\"%s\"), which is unrelated third-party funding, not the customer's "
+                      "own investment." % (fl or "see alerts", d.id, cl.strip()[:120]))
+            return Finding("ESC_THIRD_PARTY_FUNDING", "S3_third_party_investing", reason, ev, [fid])
+    return None
+
+
+THRESHOLD_TALK = re.compile(r"aggregat|exempt|below (the )?" + CUR + r"?[\d,]+|under " + CUR + r"?[\d,]+|break(ing)? (down|up)|split|"
+                            r"stay(ing)? (under|below)|keep(ing)? (individual |each )?(amounts?|transactions?|payments?|"
+                            r"deposits?|top-?ups?) (below|under)", re.I)
+
+
+def s_structuring_note(cs):
+    for d in cs.of_type("staff_note"):
+        m = THRESHOLD_TALK.search(d.body)
+        if m and re.search(CUR + r"\s?10?,?000|\b10?,?000(?:\.00)?\s?(?:GBP|pounds?)\b|threshold|report|identity|invoice|verification", d.body, re.I):
+            fid = cs.fact("customer_asked_how_to_avoid_threshold", [d.id], quote=m.group(0))
+            subj = [a for a in cs.alerts if a["rule_id"] == "TM03"] or cs.alerts
+            m3 = subj[0].get("measured") or {}
+            ids = subj[0]["transaction_ids"]
+            cnt = m3.get("count") or m3.get("payments") or len(ids)
+            reason = ("%s alert: %s transactions just under the threshold, totalling %s. Staff note %s records that the "
+                      "customer asked whether keeping amounts under the limit avoids checks or reporting. "
+                      "Splitting to stay under a threshold is structuring%s." % (
+                          subj[0]["rule_id"], cnt, fmt(m3.get("total_gbp") or sum(cs.t(i)["amount_gbp"] for i in ids if cs.t(i))),
+                          d.id, "; the documents on file do not remove that suspicion" if
+                          [x for x in cs.sig_docs if x.type in INVOICE_LIKE or x.type == "management_accounts"] else ""))
+            ev = [d.id] + ids + [x.id for x in cs.sig_docs if x.type in INVOICE_LIKE or x.type == "management_accounts"]
+            return Finding("ESC_STRUCTURING", "S4_threshold_avoidance", reason, ev, [fid])
+    return None
+
+
+def register_status(d):
+    for m in re.finditer(r"dissolved(?: on)?:?\s+", d.body, re.I):
+        md = DATE_RE.match(d.body, m.end())
+        if md and match_date(md):
+            return match_date(md)
+    return None
+
+
+def reg_company(d):
+    c = d.fields.get("company")
+    if c:
+        return c
+    m = re.search(r"extract for (.+)$", d.title)
+    return m.group(1).strip() if m else None
+
+
+def s_dissolved_payer(cs):
+    for d in cs.of_type("company_register_extract"):
+        dis = register_status(d)
+        comp = reg_company(d)
+        if not dis or not comp:
+            continue
+        ts = [t for t in cs.window_txns(10) if norm(t.get("counterparty_name")) == norm(comp)
+              and pdate(t["booked_at"]) and pdate(t["booked_at"]) > dis]
+        if ts:
+            fid = cs.fact("payer_company_dissolved_before_payment", [d.id] + [t["transaction_id"] for t in ts],
+                          company=comp, dissolved_on=str(dis))
+            for t in ts:
+                cs.edge(d.id, t["transaction_id"], "contradicts")
+            claim = ""
+            for c in chats(cs):
+                claim = " The customer's explanation in %s (\"%s\") cannot be true of a dissolved company." % (
+                    c.id, first_sentence(customer_lines(c)))
+                break
+            outs = [t for t in out_txns(cs) if not cs.profile_explained(t) and t["amount_gbp"] >= 1000]
+            onward = (" The funds were moved on (%s to %s on %s), so they have no credible source." % (fmt(outs[0]["amount_gbp"]), outs[0]["counterparty_name"],
+                                                                     dtxt(pdate(outs[0]["booked_at"])))) if outs else " The funds have no credible source."
+            reason = ("%d payments totalling %s came from %s, which %s shows was dissolved on %s, before the money was "
+                      "sent.%s%s" % (
+                          len(ts), fmt(sum(t["amount_gbp"] for t in ts)), comp, d.id, dtxt(dis), claim, onward))
+            ev = [d.id] + [t["transaction_id"] for t in ts] + [c.id for c in chats(cs)] + [t["transaction_id"] for t in outs[:3]]
+            return Finding("ESC_UNEXPLAINED_FUNDS", "S5_dissolved_payer", reason, ev, [fid])
+    return None
+
+
+def officers(d):
+    names = []
+    for tb in d.tables:
+        for row in tb:
+            for k in ("officer", "person", "person with significant control", "owner"):
+                if k in row and row[k]:
+                    names.append(row[k])
+    return names
+
+
+def incorporated(d):
+    v = d.fields.get("incorporated")
+    return pdate(v) if v else None
+
+
+def s_pass_through(cs):
+    if cs.cust.get("kind") != "business":
+        return None
+    own = [d for d in cs.of_type("company_register_extract") if norm(reg_company(d) or "") == norm(cs.cname)]
+    directors = set(norm(n) for d in own for n in officers(d))
+    if not directors:
+        return None
+    opened = pdate(cs.c.get("opened_at")) or cs.wto
+    linked = []
+    for d in cs.of_type("company_register_extract"):
+        comp = reg_company(d)
+        if not comp or norm(comp) == norm(cs.cname):
+            continue
+        inc = incorporated(d)
+        if inc and opened and (opened - inc).days <= 400 and directors & set(norm(n) for n in officers(d)):
+            linked.append((d, comp, inc))
+    if not linked:
+        return None
+    names = set(norm(c) for _, c, _ in linked)
+    outs = [t for t in cs.window_txns(10) if t["direction"] == "out" and norm(t.get("counterparty_name")) in names]
+    ins = [t for t in in_txns(cs) if not cs.profile_explained(t) and t["amount_gbp"] >= 1000]
+    if not outs and not ins:
+        return None
+    fid = cs.fact("funds_routed_to_new_companies_of_same_director", [d.id for d, _, _ in linked] +
+                  [t["transaction_id"] for t in outs], director=sorted(directors)[0])
+    cover = ""
+    for d in cs.of_type("consulting_contract"):
+        if d.amounts:
+            cover = (" The only contract on file, %s, is for a %s fee; it does not explain %s of new receipts." % (
+                d.id, fmt(max(d.amounts)), fmt(sum(t["amount_gbp"] for t in ins))))
+    dname = [n for d in own for n in officers(d)][0]
+    reason = ("%s received %d payments totalling %s and paid money on to %s, companies set up in %s by its own director "
+              "%s (%s).%s Money is passing through to linked parties with no credible purpose." % (
+                  cs.cname, len(ins), fmt(sum(t["amount_gbp"] for t in ins)), " and ".join(sorted(c for _, c, _ in linked)),
+                  " and ".join(sorted(set(str(i.year) for _, _, i in linked))), dname,
+                  ", ".join(sorted(d.id for d, _, _ in linked)), cover))
+    ev = [d.id for d, _, _ in linked] + [t["transaction_id"] for t in outs] + [t["transaction_id"] for t in ins[:6]] + \
+         [d.id for d in cs.of_type("consulting_contract")] + [d.id for d in own]
+    return Finding("ESC_PASS_THROUGH", "S6_pass_through_linked", reason, ev, [fid])
+
+
+def s_shared_device(cs):
+    for d in cs.of_type("device_export"):
+        ids = sorted(set(re.findall(r"\b[A-Z]{2}-C\d+\b", d.body)))
+        others = [i for i in ids if i != cs.c["customer_id"]]
+        if len(ids) >= 2 and others and ({"TM02", "TM04"} & set(cs.rules)):
+            countries = ""
+            for tb in d.tables:
+                for row in tb:
+                    countries = row.get("login countries", countries)
+            ins = [t for t in in_txns(cs) if not cs.profile_explained(t)]
+            fid = cs.fact("device_shared_with_other_customers", [d.id], customers=ids, countries=countries)
+            reason = ("Device export %s shows the device used on this account is also logged into by %d other customers "
+                      "(%s), with logins from %s. %d payments from different people totalling %s arrived and were paid out "
+                      "within 48 hours. Someone other than the customer appears to control the account." % (
+                          d.id, len(others), ", ".join(others), countries or "abroad", len(ins),
+                          fmt(sum(t["amount_gbp"] for t in ins))))
+            return Finding("ESC_ACCOUNT_MISUSE", "S7_shared_device", reason, [d.id] + [t["transaction_id"] for t in ins[:6]], [fid])
+    return None
+
+
+SOURCE_CLASSES = [("gift", r"\bgift|present from"), ("sale", r"\bsell|\bsold|selling|sale of"),
+                  ("loan", r"\bloan|borrow"), ("savings", r"savings"), ("inheritance", r"inherit|estate|will\b"),
+                  ("family support", r"family support|help my family|support for")]
+
+
+def claim_classes(text):
+    return set(k for k, p in SOURCE_CLASSES if re.search(p, text, re.I))
+
+
+def s_inconsistent_story(cs):
+    cl = [(d, claim_classes(customer_lines(d))) for d in chats(cs)]
+    cl = [(d, c) for d, c in cl if c]
+    if len(cl) < 2:
+        return None
+    a, b = cl[0], cl[1]
+    if a[1] & b[1]:
+        return None
+    big_cash = [cs.t(t) for al in cs.alerts_of("TM05") for t in al["transaction_ids"] if cs.t(t)]
+    outs = [t for t in out_txns(cs) if not cs.profile_explained(t) and t["amount_gbp"] >= 1000]
+    fid = cs.fact("customer_gives_conflicting_explanations", [a[0].id, b[0].id],
+                  first=sorted(a[1]), second=sorted(b[1]))
+    cs.edge(a[0].id, b[0].id, "contradicts")
+    reason = ("The customer gives conflicting accounts of the money: %s says %s, while %s says %s.%s%s "
+              "With no document behind either story, the funds have no credible explanation and were moved on." % (
+                  a[0].id, "/".join(sorted(a[1])), b[0].id, "/".join(sorted(b[1])),
+                  (" Cash deposit %s of %s." % (big_cash[0]["transaction_id"], fmt(big_cash[0]["amount_gbp"]))) if big_cash else "",
+                  (" %s was sent to %s (%s)." % (fmt(outs[0]["amount_gbp"]), outs[0]["counterparty_name"],
+                                                 outs[0]["counterparty_country"])) if outs else ""))
+    ev = [a[0].id, b[0].id] + [t["transaction_id"] for t in big_cash] + [t["transaction_id"] for t in outs[:3]]
+    return Finding("ESC_UNEXPLAINED_FUNDS", "S8_conflicting_explanations", reason, ev, [fid])
+
+
+def s_corridor(cs):
+    tm06 = cs.alerts_of("TM06")
+    if not tm06:
+        return None
+    ids = [t for a in tm06 for t in a["transaction_ids"]]
+    country = (tm06[0].get("measured") or {}).get("countries") or ""
+    # staff note: client cannot explain the routing
+    for d in cs.of_type("staff_note"):
+        if re.search(r"unable|unwilling|evasive|declin|refus|could ?n[o']t|cannot|can't|failed to|not (able|provide|explain)|"
+                     r"no (clear |plausible |credible )?(reason|justification|explanation|rationale)", d.body, re.I) and \
+                re.search(r"rout|lebanon|iraq|iran|syria|countr|abroad", d.body, re.I):
+            fid = cs.fact("client_cannot_explain_corridor", [d.id], country=country)
+            invs = [x for x in cs.of_type("supplier_invoices", "supplier_invoice", "invoice")]
+            reason = ("%s moved to or from %s, a higher-risk country the client did not declare. Staff note %s records that "
+                      "the director could not explain why the payments go to %s%s. The payments are unexplained." % (
+                          fmt(sum(cs.t(t)["amount_gbp"] for t in ids if cs.t(t))), country, d.id, country,
+                          (", and invoices %s describe services that do not fit a %s business" % (
+                              ", ".join(x.id for x in invs), (cs.cust.get("business_activity") or "").lower())) if invs else ""))
+            return Finding("ESC_HIGH_RISK_CORRIDOR", "S9_corridor_unexplained", reason,
+                           [d.id] + ids + [x.id for x in invs], [fid])
+    outs = [cs.t(t) for t in ids if cs.t(t) and cs.t(t)["direction"] == "out"]
+    people = [t for t in outs if t.get("counterparty_name") and len(norm(t["counterparty_name"]).split()) == 2
+              and not re.search(r"ltd|llc|sal|bank|center|centre|hotel|hospital", norm(t["counterparty_name"]))]
+    strangers = [t for t in people if surname(t["counterparty_name"]) != surname(cs.cname)]
+    tp_in = [t for t in in_txns(cs) if not cs.profile_explained(t) and not cs.is_self(t.get("counterparty_name"))
+             and t["amount_gbp"] >= 1000]
+    if len(set(norm(t["counterparty_name"]) for t in strangers)) >= 2 and (tp_in or len(strangers) >= 3):
+        f = [c for c in chats(cs)]
+        fid = cs.fact("split_payments_to_unrelated_people_in_high_risk_country", [t["transaction_id"] for t in strangers]
+                      + [c.id for c in f], country=country)
+        reason = ("%d payments totalling %s went to %d different people in %s, a higher-risk country the customer did not "
+                  "declare, none sharing the customer's surname%s.%s No document shows who they are, so the payments are "
+                  "unexplained." % (len(strangers), fmt(sum(t["amount_gbp"] for t in strangers)),
+                                    len(set(norm(t["counterparty_name"]) for t in strangers)), country,
+                                    (", funded by %d transfers from unrelated people (%s)" % (
+                                        len(tp_in), fmt(sum(t["amount_gbp"] for t in tp_in)))) if tp_in else "",
+                                    (" The customer's only explanation in %s is \"%s\"." % (
+                                        f[0].id, first_sentence(customer_lines(f[0])))) if f else ""))
+        ev = [t["transaction_id"] for t in strangers] + [t["transaction_id"] for t in tp_in[:4]] + [c.id for c in f]
+        return Finding("ESC_HIGH_RISK_CORRIDOR", "S9_corridor_unexplained", reason, ev, [fid])
+    return None
+
+
+RED_FLAG_GOODS = [(r"mobile phone|handset|smartphone", r"phone|mobile|telecom"),
+                  (r"consultancy|consulting|market access|advisory", r"consult|advis|services")]
+
+
+def s_invoice_mismatch(cs):
+    biz = (cs.cust.get("business_activity") or "")
+    if cs.cust.get("kind") != "business" or not biz:
+        return None
+    for d in cs.of_type("supplier_invoices", "supplier_invoice", "invoice"):
+        items = [row.get("goods", "") for tb in d.tables for row in tb if row.get("goods")]
+        if d.fields.get("goods"):
+            items.append(d.fields["goods"])
+        goods = "; ".join(items)
+        for pat, ok in RED_FLAG_GOODS:
+            if re.search(pat, goods, re.I) and not re.search(ok, biz, re.I):
+                fid = cs.fact("invoice_goods_inconsistent_with_business", [d.id], goods=goods[:120],
+                              business_activity=biz)
+                sup = (d.fields.get("supplier") or "").split(",")[0].strip()
+                outs = [t for t in cs.window_txns(10) if t["direction"] == "out" and not cs.is_self(t.get("counterparty_name"))
+                        and ((sup and norm(t.get("counterparty_name")) == norm(sup)) or amount_in(t, d))]
+                if not outs:
+                    outs = [t for t in cs.window_txns(10) if t["direction"] == "out" and t["amount_gbp"] >= 10000 and
+                            not cs.is_self(t.get("counterparty_name"))][:3]
+                reason = ("%s's declared business is \"%s\", but %s%s bills it for %s (%s in total). Those goods do not "
+                          "fit the business, so the invoice does not support %s. Invoices that do not match the client's "
+                          "trade are a red flag." % (
+                              cs.cname, biz, d.id, (" from " + sup) if sup else "", goods[:100],
+                              fmt(sum(d.amounts)) if d.amounts else "",
+                              ("the payments out (" + "; ".join(describe_txn(t) for t in outs[:2]) + ")") if outs
+                              else "the alerted activity"))
+                ev = [d.id] + [a["alert_id"] for a in cs.alerts] + cs.alerted[:6] + [t["transaction_id"] for t in outs]
+                return Finding("ESC_INVOICE_MISMATCH", "S10_invoice_goods_mismatch", reason, ev, [fid])
+    return None
+
+
+def s_payment_file_mule(cs):
+    for d in cs.of_type("payment_file"):
+        rows = [r for tb in d.tables for r in tb if "address" in r]
+        if not rows:
+            continue
+        addr = {}
+        for r in rows:
+            addr.setdefault(norm(r["address"]), []).append(r)
+        shared = {k: v for k, v in addr.items() if len(v) >= 2}
+        uk_pc = [r for r in rows if re.search(r"\b[A-Z]{1,2}\d{1,2}[A-Z]? ?\d[A-Z]{2}\b", r["address"])
+                 and norm(r.get("country")) not in ("united kingdom", "uk")]
+        if shared or len(uk_pc) >= 2:
+            fid = cs.fact("payees_share_addresses_inconsistent_with_country", [d.id], shared_addresses=len(shared),
+                          uk_address_abroad=len(uk_pc))
+            tp = [cs.t(t) for a in cs.alerts_of("TM08") for t in a["transaction_ids"] if cs.t(t)]
+            k0 = sorted(shared)[0] if shared else None
+            reason = ("Payment file %s lists %d payees; %d addresses are shared by several payees (e.g. %s) and %d payees "
+                      "said to be abroad have UK addresses.%s Many small payments to linked people funded by a third "
+                      "party indicate the account is passing on other people's money." % (
+                          d.id, len(rows), len(shared), (", ".join(r["payee"] for r in shared[k0][:3]) + " at " +
+                                                         shared[k0][0]["address"]) if k0 else "-", len(uk_pc),
+                          (" The money came in from %s (%s), whose account is not the client's." % (
+                              tp[0]["counterparty_name"], fmt(tp[0]["amount_gbp"]))) if tp else ""))
+            ev = [d.id] + [t["transaction_id"] for t in tp]
+            return Finding("ESC_MULE_ACTIVITY", "S11_payment_file_linked_payees", reason, ev, [fid])
+    return None
+
+
+SUSPICION_RULES = [s_fraud_reports, s_mule_chat, s_structuring_note, s_dissolved_payer, s_pass_through,
+                   s_third_party_investing, s_payment_file_mule, s_shared_device, s_inconsistent_story, s_corridor,
+                   s_invoice_mismatch]
+
+
+# ----------------------------------------------------------------------------
+# Internal-list (TM22) resolution: cleared / confirmed / unsettled
+# ----------------------------------------------------------------------------
+def rget(r, *keys):
+    """Tolerant table-cell lookup: exact header first, then a header starting with the key."""
+    for k in keys:
+        if r.get(k):
+            return r[k]
+    for k in keys:
+        for h, v in sorted(r.items()):
+            if h.startswith(k) and v:
+                return v
+    return ""
+
+
+def dob_near(text, name):
+    """Find a date of birth stated for `name` in free text ('born 17 February 1959', '(DOB: 8 June 1969)')."""
+    if not name:
+        return None
+    for m in re.finditer(re.escape(name), text, re.I):
+        win = text[m.end(): m.end() + 80]
+        for mm in re.finditer(r"(?:born(?: on)?|DOB:?|date of birth:?)\s*", win, re.I):
+            md = DATE_RE.match(win, mm.end())
+            if md and match_date(md):
+                return match_date(md)
+    return None
+
+
+def resolve_tm22(cs, a):
+    m = a.get("measured") or {}
+    L = cs.list_entries.get(m.get("list_entry"))
+    basis = (m.get("matched_on") or "").lower()
+    tids = a.get("transaction_ids", [])
+    t = cs.t(tids[0]) if tids else None
+    pay = pdate(t["booked_at"]) if t else None
+    if not L:
+        return {"status": "unsettled", "basis": basis, "docs": [], "note": "list entry not found"}
+    lname, ldob = L.get("name") or "", pdate(L.get("date_of_birth"))
+    cs.edge(a["alert_id"], L["entry_id"], "matches")
+    res = {"status": "unsettled", "basis": basis, "entry": L["entry_id"], "lname": lname, "docs": [], "note": "",
+           "pay": pay, "txn": t}
+    if "officer" in basis:
+        psc_rows, reg_rows = [], []
+        for d in cs.of_type("significant_control_register"):
+            for tb in d.tables:
+                for r in tb:
+                    if norm(rget(r, "person", "name")) == norm(lname):
+                        psc_rows.append((d, r))
+        for d in cs.of_type("company_register_extract"):
+            for tb in d.tables:
+                for r in tb:
+                    if norm(rget(r, "officer", "name")) == norm(lname):
+                        reg_rows.append((d, r))
+        # A different birth month/year on the register disproves identity
+        for d, r in reg_rows + psc_rows:
+            born = rget(r, "born", "date of birth", "dob")
+            mb = month_year(born or "")
+            if mb and ldob and (mb[1] != ldob.year or mb[0] != ldob.month):
+                fid = cs.fact("officer_birth_differs_from_list", [d.id, L["entry_id"]], register_born=born,
+                              list_dob=str(ldob))
+                cs.edge(d.id, L["entry_id"], "contradicts")
+                res.update(status="cleared", docs=[d.id], fact=fid,
+                           note="%s gives %s's birth as %s, but list entry %s has %s" % (d.id, lname, born, L["entry_id"],
+                                                                                      dtxt(ldob)))
+                return res
+        for d, r in psc_rows:
+            ceased = pdate(rget(r, "ceased"))
+            if pay and (ceased is None or ceased >= pay):
+                fid = cs.fact("listed_person_controlled_counterparty_at_payment", [d.id, L["entry_id"]] + tids,
+                              control=rget(r, "control", "nature"), ceased=str(ceased) if ceased else None, payment=str(pay))
+                cs.edge(d.id, L["entry_id"], "supports")
+                regs = [x.id for x, _ in reg_rows]
+                for x, rr in reg_rows:
+                    rs = pdate(rget(rr, "resigned"))
+                    if rs and pay and rs <= pay:
+                        # the register's resignation date is overridden by continuing control on the PSC register
+                        cs.fact("officer_resigned_before_payment", [x.id], resigned=str(rs), payment=str(pay))
+                        cs.edge(d.id, x.id, "contradicts")
+                res.update(status="confirmed", docs=[d.id] + regs, fact=fid,
+                           note=("%s shows %s held \"%s\" in the company until %s, so they still controlled it when the "
+                                 "%s payment was made on %s" % (d.id, lname, rget(r, "control", "nature"),
+                                                                dtxt(ceased) if ceased else "now",
+                                                                fmt(t["amount_gbp"]) if t else "", dtxt(pay))))
+                return res
+        if psc_rows or reg_rows:
+            ended = all(pdate(rget(r, "ceased", "resigned")) and pay and
+                        pdate(rget(r, "ceased", "resigned")) < pay for _, r in psc_rows + reg_rows)
+            if ended and psc_rows:
+                d = psc_rows[0][0]
+                fid = cs.fact("listed_person_left_before_payment", [d.id, L["entry_id"]])
+                res.update(status="cleared", docs=sorted(set(x.id for x, _ in psc_rows + reg_rows)), fact=fid,
+                           note="%s shows %s's control ended before the payment on %s" % (d.id, lname, dtxt(pay)))
+                return res
+        res["note"] = "no register shows who controlled the counterparty at the time of payment"
+        return res
+    if "address" in basis:
+        lunit = re.search(r"\bUnit \w+", (L.get("reason") or "") + " " + (L.get("address") or ""))
+        best = None
+        for d in cs.of_type("company_register_extract", "receipt", "invoice"):
+            u = re.search(r"\bUnit \w+", d.body)
+            if u and (d.type != "company_register_extract" or norm(reg_company(d) or "") != norm(cs.cname)):
+                best = best or (d, u.group(0))
+                if d.type == "company_register_extract":
+                    best = (d, u.group(0))
+        if lunit and best and norm(best[1]) != norm(lunit.group(0)):
+            d, unit = best
+            fid = cs.fact("counterparty_address_differs_from_list", [d.id, L["entry_id"]], counterparty_unit=unit,
+                          list_unit=lunit.group(0))
+            cs.edge(d.id, L["entry_id"], "contradicts")
+            others = [x.id for x in cs.of_type("company_register_extract", "receipt") if x.id != d.id]
+            res.update(status="cleared", docs=[d.id] + others, fact=fid,
+                       note=("list entry %s is %s, an %s linked to %s, while %s places %s at %s; the shared building is "
+                             "the only link" % (L["entry_id"], lname, L.get("kind"), lunit.group(0), d.id,
+                                               t["counterparty_name"] if t else "the payee", unit)))
+            return res
+        res["note"] = "nothing on file shows whether the payee at the matched address is the listed party"
+        return res
+    # name (or anything else): look for a date of birth for the counterparty
+    cp = (t or {}).get("counterparty_name") or lname
+    for d in cs.sig_docs:
+        dob = dob_near(d.text, cp) or dob_near(d.text, lname)
+        if dob and ldob:
+            if dob == ldob:
+                fid = cs.fact("counterparty_dob_equals_list_dob", [d.id, L["entry_id"]], dob=str(dob))
+                cs.edge(d.id, L["entry_id"], "supports")
+                res.update(status="confirmed", docs=[d.id], fact=fid,
+                           note="%s gives %s's date of birth as %s, the same as list entry %s" % (d.id, cp, dtxt(dob),
+                                                                                                L["entry_id"]))
+            else:
+                fid = cs.fact("counterparty_dob_differs_from_list", [d.id, L["entry_id"]], dob=str(dob), list_dob=str(ldob))
+                cs.edge(d.id, L["entry_id"], "contradicts")
+                res.update(status="cleared", docs=[d.id], fact=fid,
+                           note="%s gives %s's date of birth as %s, but list entry %s was born on %s" % (
+                               d.id, cp, dtxt(dob), L["entry_id"], dtxt(ldob)))
+            return res
+    for d in cs.of_type("company_register_extract"):
+        for tb in d.tables:
+            for r in tb:
+                if norm(r.get("officer", rget(r, "person", "name"))) == norm(lname) and rget(r, "born") and ldob:
+                    mb = month_year(rget(r, "born"))
+                    if mb and (mb[1] != ldob.year):
+                        res.update(status="cleared", docs=[d.id], note="%s gives %s's birth as %s, list entry %s has %s" % (
+                            d.id, lname, rget(r, "born"), L["entry_id"], dtxt(ldob)))
+                        return res
+    res["note"] = "only the name matches; nothing on file gives %s's date of birth or address" % cp
+    return res
+
+
+# ----------------------------------------------------------------------------
+# Explanation rules: each covers transactions with a document (accounting-style)
+# ----------------------------------------------------------------------------
+class Expl(object):
+    def __init__(self, code, rule, docs, txns, note, onward=0.0):
+        self.code, self.rule, self.docs, self.txns, self.note, self.onward = code, rule, list(docs), list(txns), note, onward
+
+    def direction_in(self, cs):
+        return any((cs.t(t) or {}).get("direction") == "in" for t in self.txns)
+
+
+def statement_holders(d):
+    h = ""
+    for k in ("account holder", "account holders", "name on account", "account name", "name of account holder",
+              "holder", "holders", "account in the name of"):
+        if d.fields.get(k):
+            h = d.fields[k]
+            break
+    names = [x.strip() for x in re.split(r",| and | & (?=\S+ \S)", h) if x.strip()]
+    for m in re.finditer(r"(?:held by|held in the name of|in the name of|registered to|belongs to|belonging to)"
+                         r" ([A-Z][\w&' -]+?)(?:\.|,|$)", d.body, re.M):
+        names.append(m.group(1).strip())
+    if re.search(r"held in (my|your) name|in your name", d.body, re.I):
+        names.append("__self__")
+    return names
+
+
+def statement_keys(d):
+    keys = set()
+    for v in (d.fields.get("account"),):
+        k = acct_key(v) if v and re.search(r"\d", v) else None
+        if k:
+            keys.add(k)
+    for m in re.finditer(r"(?:IBAN|account) ending (\d{4})", d.body):
+        keys.add(m.group(1))
+    for m in re.finditer(r"\b\d{2}-\d{2}-\d{2} (\d{8})\b", d.body):
+        keys.add(m.group(1)[-4:])
+    return keys
+
+
+def x_own_statements(cs, cands):
+    out = []
+    for d in cs.of_type("bank_statement", "customer_letter", "customer_email", "cancellation_confirmation"):
+        holders = statement_holders(d)
+        own = any(h == "__self__" or norm(h) == norm(cs.cname) for h in holders)
+        if d.type == "bank_statement" and not own:
+            continue
+        if d.type != "bank_statement" and not own:
+            continue
+        keys = statement_keys(d)
+        cov = []
+        for t in cands:
+            k = acct_key(t.get("counterparty_account"))
+            if (k and k in keys) or (cs.is_self(t.get("counterparty_name")) and amount_in(t, d)):
+                if amount_in(t, d) or (k and k in keys and d.type == "bank_statement"):
+                    cov.append(t["transaction_id"])
+        if cov:
+            onward = sum(cs.t(x)["amount_gbp"] for x in cov if cs.t(x)["direction"] == "out")
+            out.append(Expl("OWN_ACCOUNT", "X2_own_account_statement", [d.id], cov,
+                            "%s shows the account %s is held by %s" % (d.id, sorted(keys)[0] if keys else "",
+                                                                       cs.cname), onward))
+    return out
+
+
+def x_documents(cs, cands):
+    out = []
+    has_factoring = cs.of_type("factoring_agreement")
+    for d in cs.sig_docs:
+        code = EXPLAIN_TYPES.get(d.type)
+        if d.type == "remittance_advice" and has_factoring:
+            code = "THIRD_PARTY_DOCUMENTED"
+        if not code:
+            continue
+        cov = []
+        if d.type == "payment_file":
+            rows = [r for tb in d.tables for r in tb]
+            for r in rows:
+                nm = r.get("payee") or r.get("contractor") or ""
+                am = money(r.get("amount", ""))
+                for t in cands:
+                    if t["direction"] == "out" and norm(t.get("counterparty_name")) == norm(nm) and am and \
+                            abs(am[0] - t["amount_gbp"]) <= 0.01:
+                        cov.append(t["transaction_id"])
+        else:
+            for t in cands:
+                if amount_in(t, d) and (party_match(t, d) or norm(cs.cname) in d.ntext):
+                    if d.type == "remittance_advice" and not any(party_match(t, f) for f in has_factoring):
+                        continue
+                    cov.append(t["transaction_id"])
+        if cov:
+            onward = sum(cs.t(x)["amount_gbp"] for x in cov if cs.t(x)["direction"] == "out")
+            sup = [f.id for f in has_factoring] if d.type == "remittance_advice" else []
+            out.append(Expl(code, "X1_document_reconciles", [d.id] + sup, sorted(set(cov)),
+                            "%s (%s) reconciles to the amounts" % (d.id, d.type.replace("_", " ")), onward))
+    return out
+
+
+def x_booking(cs, cands):
+    out = []
+    for d in cs.of_type("booking_confirmation"):
+        trav = set(norm(x) for x in re.findall(r"^\s*\d+\.\s+(.+?)\s*$", d.body, re.M))
+        lead = d.fields.get("lead traveller")
+        if lead:
+            trav.add(norm(lead))
+        m = re.search(r"transfer to (.+?), account", d.body)
+        payee = norm(m.group(1)) if m else ""
+        cov = []
+        for t in cands:
+            if t["direction"] == "in" and norm(t.get("counterparty_name")) in trav:
+                cov.append(t["transaction_id"])
+            elif t["direction"] == "out" and payee and norm(t.get("counterparty_name")) == payee and amount_in(t, d):
+                cov.append(t["transaction_id"])
+        if cov:
+            out.append(Expl("COLLECTION_DOCUMENTED", "X3_group_collection", [d.id], cov,
+                            "%s lists %d travellers and the payment to %s" % (d.id, len(trav), m.group(1) if m else "")))
+    return out
+
+
+def x_group(cs, cands):
+    out = []
+    for d in cs.of_type("group_structure"):
+        edges = []
+        for tb in d.tables:
+            for r in tb:
+                comp = r.get("company")
+                own = r.get("owner") or r.get("owned by")
+                if comp and own:
+                    edges.append((norm(comp), norm(own)))
+        def roots(x, seen=()):
+            ps = [o for c, o in edges if c == x and o not in seen]
+            if not ps:
+                return {x}
+            s = set()
+            for p in ps:
+                s |= roots(p, seen + (x,))
+            return s
+        me = norm(cs.cname)
+        members = set([c for c, _ in edges] + [o for _, o in edges])
+        if me not in members:
+            continue
+        cov = [t["transaction_id"] for t in cands if norm(t.get("counterparty_name")) in members and
+               norm(t.get("counterparty_name")) != me and (roots(norm(t["counterparty_name"])) & roots(me) or
+                                                          norm(t["counterparty_name"]) in roots(me))]
+        if cov:
+            sup = [e.id for e in cs.of_type("email") if re.search(r"both companies are mine|same group|our group", e.body, re.I)]
+            out.append(Expl("GROUP_COMPANY", "X4_group_company", [d.id] + sup, cov,
+                            "%s shows %s and the counterparty share an owner" % (d.id, cs.cname)))
+    return out
+
+
+def x_redeposit(cs, cands):
+    out = []
+    revs = [r for r in cs.reviews if r["rule_id"] == "TM05" and re.search(r"withdraw", r["note"], re.I)]
+    for a in cs.alerts_of("TM05"):
+        for tid in a["transaction_ids"]:
+            t = cs.t(tid)
+            if not t or t["direction"] != "in":
+                continue
+            for d in chats(cs):
+                if not re.search(r"\bback\b|withdrew|withdrawn|same cash", customer_lines(d) + d.body, re.I):
+                    continue
+                wd = [w for w in cs.all_txns if w["channel"] == "cash_withdrawal" and abs(w["amount_gbp"] - t["amount_gbp"]) < 0.01
+                      and w["booked_at"] < t["booked_at"]]
+                if wd and revs:
+                    cs.edge(wd[-1]["transaction_id"], tid, "explains")
+                    out.append(Expl("DOCUMENTED_EVENT", "X5_cash_redeposited", [d.id, revs[-1]["review_id"]],
+                                    [tid, wd[-1]["transaction_id"]],
+                                    "the %s paid in on %s is the cash withdrawn on %s (%s), reviewed and closed in %s "
+                                    "(\"%s\")" % (fmt(t["amount_gbp"]), dtxt(pdate(t["booked_at"])),
+                                                  dtxt(pdate(wd[-1]["booked_at"])), wd[-1]["transaction_id"],
+                                                  revs[-1]["review_id"], revs[-1]["note"])))
+    return out
+
+
+def x_redemption(cs, cands):
+    out = []
+    for a in cs.alerts_of("TM10"):
+        red = cs.of_type("redundancy_letter")
+        em = [d for d in cs.of_type("customer_email") if re.search(r"\bsell|\bsale|withdraw", d.body, re.I)]
+        if red and em:
+            out.append(Expl("DOCUMENTED_EVENT", "X6_redemption_reason_documented", [red[0].id, em[0].id],
+                            a["transaction_ids"], "%s confirms redundancy and %s asks to sell the fund to cover living "
+                                                  "costs" % (red[0].id, em[0].id)))
+    return out
+
+
+EXPLAINERS = [x_own_statements, x_documents, x_booking, x_group, x_redeposit, x_redemption]
+
+
+# ----------------------------------------------------------------------------
+# Reconciliation per alert, against the threshold that made the rule fire
+# ----------------------------------------------------------------------------
+def reconcile(cs, a, covered, onward_credit):
+    r, m = a["rule_id"], a.get("measured") or {}
+    ids = [i for i in a["transaction_ids"] if cs.t(i)]
+    txs = [cs.t(i) for i in ids]
+    prof = [t for t in txs if cs.profile_explained(t)]
+    expl = [t for t in txs if t["transaction_id"] in covered]
+    une = [t for t in txs if t["transaction_id"] not in covered and not cs.profile_explained(t)]
+    rec = {"alert_id": a["alert_id"], "rule": r, "alerted_gbp": round(sum(t["amount_gbp"] for t in txs), 2),
+           "explained_gbp": round(sum(t["amount_gbp"] for t in expl), 2),
+           "profile_gbp": round(sum(t["amount_gbp"] for t in prof), 2),
+           "unexplained_gbp": round(sum(t["amount_gbp"] for t in une), 2),
+           "unexplained_txns": [t["transaction_id"] for t in une]}
+    if r == "TM01":
+        received = m.get("received_gbp") or sum(t["amount_gbp"] for t in txs if t["direction"] == "in")
+        ex_in = sum(t["amount_gbp"] for t in expl if t["direction"] == "in")
+        if cs.inst == "payments_fx":
+            own_in = sum(t["amount_gbp"] for t in txs if t["direction"] == "in" and cs.is_self(t.get("counterparty_name"))
+                         and t["transaction_id"] not in covered)
+            ex_in += min(onward_credit, own_in)
+        limit = (m.get("limit_multiple") or 0) * (m.get("baseline_gbp") or 0)
+        rest = round(received - ex_in, 2)
+        rec["unexplained_txns"] = [t["transaction_id"] for t in txs if t["direction"] == "in" and
+                                   t["transaction_id"] not in covered and not (cs.profile_explained(t) and
+                                                                               cs.inst != "payments_fx")]
+        rec.update(explained_gbp=round(ex_in, 2), unexplained_gbp=max(rest - limit, 0.0) if rest > limit else 0.0,
+                   residual_activity_gbp=rest, limit_gbp=round(limit, 2))
+        rec["cleared"] = ex_in > 0 and rest <= limit
+    elif r == "TM02":
+        un_in = sum(t["amount_gbp"] for t in une if t["direction"] == "in")
+        rec["cleared"] = un_in < cs.pol["tm02_min"]
+        rec["unexplained_gbp"] = round(un_in, 2)
+    elif r == "TM03":
+        rec["cleared"] = not une
+    elif r == "TM04":
+        n = len(set(norm(t["counterparty_name"]) for t in une if t["direction"] == (
+            "in" if m.get("direction") == "incoming" else "out")))
+        rec["cleared"] = n <= (m.get("limit") or 0)
+        rec["unexplained_counterparties"] = n
+    elif r in ("TM06", "TM07"):
+        rec["cleared"] = sum(t["amount_gbp"] for t in une) < (m.get("limit_gbp") or 5000)
+    elif r in ("TM05", "TM08", "TM10", "TM22"):
+        rec["cleared"] = not une
+    else:
+        rec["cleared"] = not une
+    return rec
+
+
+# ----------------------------------------------------------------------------
+# RFI asks
+# ----------------------------------------------------------------------------
+def describe_txn(t):
+    return "%s %s %s on %s%s" % (fmt(t["amount_gbp"]), "from" if t["direction"] == "in" else "to",
+                                 t.get("counterparty_name") or ("cash at " + (t.get("location") or "branch")),
+                                 dtxt(pdate(t["booked_at"])),
+                                 (" (ref %s)" % t["reference"]) if t.get("reference") and t["reference"] not in
+                                 ("transfer", "payment") else "")
+
+
+def rfi_for(cs, rec):
+    r = rec["rule"]
+    une = [cs.t(i) for i in rec["unexplained_txns"]]
+    une.sort(key=lambda t: (-t["amount_gbp"], t["transaction_id"]))
+    top = une[:3]
+    lst = "; ".join(describe_txn(t) for t in top)
+    if r == "TM08":
+        t = top[0] if top else None
+        cp = (t or {}).get("counterparty_name") or ""
+        if re.search(r"conveyanc|solicitor|client account", cp, re.I):
+            return ("RFI_SOURCE_OF_FUNDS", "Ask the customer for the completion statement or solicitor's letter showing "
+                    "what the %s is (e.g. a property sale) and that it belongs to them." % lst)
+        if "&" in cp:
+            return ("RFI_COUNTERPARTY_DETAILS", "Ask the customer for a statement or bank letter showing that they are a "
+                    "holder of the joint account '%s' that sent %s; a similar name alone does not show it is their own "
+                    "account." % (cp, lst))
+        if re.search(r"finance|factor", cp, re.I):
+            return ("RFI_COUNTERPARTY_DETAILS", "Ask the client for the invoice-finance or factoring agreement with %s and "
+                    "the remittance advice for %s." % (cp, lst))
+        return ("RFI_COUNTERPARTY_DETAILS", "Ask the customer who %s is, their relationship to the customer and what %s "
+                "was for." % (cp or "the third party", lst))
+    if r == "TM04" and cs.inst == "payments_fx":
+        n = len(set(norm(t["counterparty_name"]) for t in une))
+        return ("RFI_BUSINESS_RECORDS", "Ask the client for the business records (invoices, contracts or a payment "
+                "file) behind the payments to %d beneficiaries in the window, starting with %s." % (n, lst))
+    if r in ("TM02", "TM04", "TM10"):
+        if cs.inst == "payments_fx":
+            return ("RFI_BUSINESS_RECORDS", "Ask the client for the business records behind the activity: invoices or "
+                    "shipment records for the payments received from third parties and paid on (%s)." % lst)
+        if r == "TM10":
+            return ("RFI_PURPOSE_DOCUMENTS", "Ask the customer why the fund units were sold back so soon (%s) and for a "
+                    "document supporting the reason." % lst)
+        return ("RFI_PURPOSE_DOCUMENTS", "Ask the customer for documents showing what these payments were for (%s), "
+                "e.g. the agreement, booking or invoice behind them." % lst)
+    if r == "TM03":
+        return ("RFI_PURPOSE_DOCUMENTS", "Ask the client for the invoice or contract covering the split payments (%s); "
+                "payments of this size need an invoice on file." % lst)
+    if r == "TM06":
+        return ("RFI_PURPOSE_DOCUMENTS", "Ask for documents showing the purpose of the payments to or from %s (%s)." % (
+            (rec.get("country") or "the higher-risk country"), lst))
+    if r in ("TM03", "TM07") and cs.inst == "payments_fx":
+        return ("RFI_PURPOSE_DOCUMENTS", "Ask the client for the invoice or contract behind the payments (%s), showing "
+                "what was bought and from whom." % lst)
+    if r == "TM01" and cs.inst == "payments_fx":
+        return ("RFI_BUSINESS_RECORDS", "Ask the client for the business records behind the %s received in the window "
+                "(%s in excess of its declared volume), e.g. the orders, invoices or contracts the funds relate to." % (
+                    fmt(rec.get("residual_activity_gbp") or rec["alerted_gbp"]), fmt(rec.get("unexplained_gbp") or 0)))
+    # TM01, TM05, TM07 and others: where did the money come from
+    return ("RFI_SOURCE_OF_FUNDS", "Ask the customer for proof of where the money came from for %s, e.g. a letter, "
+            "contract or statement from the payer." % (lst or "the activity"))
+
+
+RFI_PRIORITY = ["TM22", "TM08", "TM10", "TM04", "TM02", "TM03", "TM06", "TM05", "TM07", "TM01"]
+
+
+# ----------------------------------------------------------------------------
+# Close reasons
+# ----------------------------------------------------------------------------
+CLOSE_LEAD = {
+    "LIST_MATCH_DIFFERENT_PARTY": "The internal-list match is a different party.",
+    "RETURNING_CUSTOMER": "The returning customer has been re-verified and the reactivation activity is explained.",
+    "COLLECTION_DOCUMENTED": "The payments are a documented group collection.",
+    "BUSINESS_RECORDS_RECONCILE": "The business's own records reconcile to the alerted activity.",
+    "GROUP_COMPANY": "The counterparty is a company in the customer's own group.",
+    "REFUND_OF_EARLIER_PAYMENT": "The funds are a refund of an earlier payment.",
+    "DOCUMENTED_EVENT": "The activity is explained by a documented one-off event.",
+    "INVOICE_MATCHES": "The payments match invoices on file.",
+    "THIRD_PARTY_DOCUMENTED": "The third-party funds are documented.",
+    "OWN_ACCOUNT": "The money moved between accounts the customer is shown to hold.",
+    "WITHIN_PROFILE": "The alerted activity is within the customer's declared profile.",
+}
+
+
+def expl_sentence(cs, e):
+    ts = [cs.t(x) for x in e.txns if cs.t(x)]
+    ts.sort(key=lambda t: (-t["amount_gbp"], t["transaction_id"]))
+    parts = ["%s %s" % (t["transaction_id"], describe_txn(t)) for t in ts[:2]]
+    more = (" and %d more" % (len(ts) - 2)) if len(ts) > 2 else ""
+    return "%s, covering %s%s." % (e.note[0].upper() + e.note[1:], "; ".join(parts), more)
+
+
+def case_alert_summary(cs):
+    bits = []
+    for a in cs.alerts:
+        m = a.get("measured") or {}
+        bits.append("%s (%s)" % (a["alert_id"], a["rule_id"]))
+    return ", ".join(bits)
+
+
+# ----------------------------------------------------------------------------
+# Decision ladder
+# ----------------------------------------------------------------------------
+def decide(cs):
+    """Returns (code, reason, evidence, trace_extra)."""
+    trace = {"reconciliation": [], "tm22": []}
+    # 1. suspicion facts -> ESCALATE
+    for rule in SUSPICION_RULES:
+        f = rule(cs)
+        if f:
+            cs.fire(f.rule, f.code, f.facts)
+            return f.code, f.reason, f.evidence, trace
+    # 2. internal list
+    tm22 = []
+    for a in cs.alerts_of("TM22"):
+        res = resolve_tm22(cs, a)
+        tm22.append(res)
+        trace["tm22"].append({k: (v if not isinstance(v, (date, dict)) else str(v) if isinstance(v, date) else None)
+                              for k, v in res.items() if k != "txn"})
+        cs.fire("R_TM22_%s" % res["basis"].replace(" ", "_"), res["status"], [res.get("fact")] if res.get("fact") else [])
+        if res["status"] == "confirmed":
+            t = res.get("txn")
+            reason = ("Alert %s matched %s to list entry %s (%s) on %s. %s. Under policy a listed party that is the "
+                      "counterparty or controls it at the time of payment must be escalated, even where the role "
+                      "later ended." % (a["alert_id"], (t or {}).get("counterparty_name", "the counterparty"),
+                                        res["entry"], res["lname"], res["basis"], res["note"][0].upper() + res["note"][1:]))
+            ev = [a["alert_id"], res["entry"]] + res["docs"] + list(a["transaction_ids"])
+            return "ESC_LISTED_PARTY", reason, ev, trace
+    # 3. explanations and reconciliation
+    cands = cs.window_txns()
+    expls = []
+    for x in EXPLAINERS:
+        for e in x(cs, cands):
+            expls.append(e)
+            fid = cs.fact("explains", e.docs + e.txns, code=e.code, rule=e.rule)
+            cs.fire(e.rule, e.code, [fid], docs=e.docs, txns=e.txns)
+            for d in e.docs:
+                for t in e.txns:
+                    cs.edge(d, t, "explains")
+    covered = {}
+    for e in expls:
+        for t in e.txns:
+            covered.setdefault(t, []).append(e)
+    onward = sum(e.onward for e in expls if e.code in ("OWN_ACCOUNT", "INVOICE_MATCHES"))
+    recs = []
+    for a in cs.alerts:
+        if a["rule_id"] == "TM22":
+            res = [r for r in tm22 if r.get("entry") == (a.get("measured") or {}).get("list_entry")]
+            st = res[0]["status"] if res else "unsettled"
+            rec = reconcile(cs, a, covered, onward)
+            rec["cleared"] = st == "cleared"
+            rec["list_status"] = st
+        else:
+            rec = reconcile(cs, a, covered, onward)
+        rec["explained_by"] = sorted(set(d for t in a["transaction_ids"] for e in covered.get(t, []) for d in e.docs))
+        recs.append(rec)
+        cs.fire("R_RECONCILE_%s" % a["rule_id"], "cleared" if rec["cleared"] else "open", [],
+                alert=a["alert_id"])
+    trace["reconciliation"] = recs
+    open_recs = [r for r in recs if not r["cleared"]]
+    all_text = " ".join(d.body for d in cs.sig_docs) + " " + " ".join(r["note"] for r in cs.reviews)
+    # 3a. unsettled: keyword suspicion escalates, else RFI
+    if open_recs:
+        if SUSPICION_WORDS.search(all_text):
+            w = SUSPICION_WORDS.search(all_text).group(0)
+            src = [d.id for d in cs.sig_docs if SUSPICION_WORDS.search(d.body)]
+            cs.fire("R_KEYWORD_SUSPICION", "ESC_UNEXPLAINED_FUNDS", [cs.fact("suspicion_keyword", src, word=w)])
+            return ("ESC_UNEXPLAINED_FUNDS", "The activity on %s is not reconciled to evidence and %s refers to '%s'. "
+                    "Unexplained activity with that indicator is escalated." % (case_alert_summary(cs),
+                                                                               ", ".join(src[:2]), w),
+                    [r["alert_id"] for r in open_recs] + src[:3], trace)
+        prio = RFI_PRIORITY
+        if cs.inst == "payments_fx":  # a business's third-party flows: business records come first
+            prio = ["TM22", "TM02", "TM04", "TM08"] + [x for x in RFI_PRIORITY if x not in ("TM22", "TM02", "TM04", "TM08")]
+        open_recs.sort(key=lambda r: (prio.index(r["rule"]) if r["rule"] in prio else 99, r["alert_id"]))
+        r0 = open_recs[0]
+        a0 = [a for a in cs.alerts if a["alert_id"] == r0["alert_id"]][0]
+        # cash deposits split under a threshold with nothing on file -> structuring
+        if r0["rule"] == "TM03" and all((cs.t(t) or {}).get("channel", "").startswith("cash") for t in a0["transaction_ids"]) \
+                and not cs.sig_docs:
+            m = a0.get("measured") or {}
+            reason = ("Alert %s: %d cash deposits totalling %s, each below the reporting threshold, with no business "
+                      "records or other explanation on file. The pattern is consistent with structuring." % (
+                          a0["alert_id"], len(a0["transaction_ids"]), fmt(r0["alerted_gbp"])))
+            return "ESC_STRUCTURING", reason, [a0["alert_id"]] + a0["transaction_ids"], trace
+        if r0["rule"] == "TM22":
+            res = [r for r in tm22 if r.get("entry") == (a0.get("measured") or {}).get("list_entry")][0]
+            t = res.get("txn") or {}
+            code = "RFI_COUNTERPARTY_DETAILS"
+            ask = ("Ask the customer for details identifying %s (date of birth, address or company registration) so "
+                   "it can be confirmed whether they are %s on list entry %s; %s." % (
+                       t.get("counterparty_name", "the counterparty"), res.get("lname"), res.get("entry"), res.get("note")))
+            ev = [a0["alert_id"], res.get("entry")] + a0["transaction_ids"] + res["docs"]
+        else:
+            code, ask = rfi_for(cs, r0)
+            if cs.inst == "payments_fx" and r0["rule"] in ("TM01", "TM03", "TM07") and code != "RFI_BUSINESS_RECORDS":
+                code = "RFI_PURPOSE_DOCUMENTS"
+            ev = [a0["alert_id"]] + r0["unexplained_txns"][:10] + r0["explained_by"]
+        if r0["rule"] == "TM22":
+            reason = ("Alert %s matched %s to internal-list entry %s (%s) on %s, and nothing on file settles whether "
+                      "they are the same party. %s" % (a0["alert_id"], t.get("counterparty_name", "the counterparty"),
+                                                       res.get("entry"), res.get("lname"), res.get("basis"),
+                                                       ask.split("; ")[0] + "."))
+        else:
+            reason = ("Alert %s (%s) is not fully explained: %s of the alerted %s is not reconciled to any document "
+                      "on file. %s" % (a0["alert_id"], a0["rule_id"], fmt(r0["unexplained_gbp"]) if
+                                       r0["unexplained_gbp"] else "part", fmt(r0["alerted_gbp"]), ask))
+        cs.fire("R_RFI", code, [], alert=a0["alert_id"])
+        return code, reason, ev, trace
+    # 3b. payments_fx: held payment >= threshold to a non-client needs an invoice
+    if cs.pol["invoice_required_gbp"] and cs.held and cs.t(cs.held):
+        h = cs.t(cs.held)
+        if h["amount_gbp"] >= cs.pol["invoice_required_gbp"] and not cs.is_self(h.get("counterparty_name")) and \
+                not any(d.type in INVOICE_LIKE for d in cs.sig_docs) and not covered.get(cs.held):
+            return ("RFI_PURPOSE_DOCUMENTS", "Held payment %s of %s is not covered by any invoice on file. Payments of "
+                    "%s or more to a non-client need an invoice; ask the client for the invoice or contract behind "
+                    "it." % (cs.held, describe_txn(h), fmt(cs.pol["invoice_required_gbp"])), [cs.held], trace)
+    # 4. own-account at >= 5x profile -> profile update
+    for a in cs.alerts_of("TM01"):
+        m = a.get("measured") or {}
+        es = [e for t in a["transaction_ids"] for e in covered.get(t, [])]
+        if cs.inst == "payments_fx" and not [e for e in es if e.direction_in(cs)]:
+            es = es + [e for e in expls if e.onward > 0]
+        if es and all(e.code == "OWN_ACCOUNT" for e in es) and (m.get("multiple") or 0) >= OWN_ACCOUNT_RFI_MULTIPLE:
+            docs = sorted(set(d for e in es for d in e.docs))
+            reason = ("Alert %s: %s received in the window, %.1fx the declared monthly %s. %s shows the money came from "
+                      "the customer's own account, but activity at %.0fx or more of the declared profile needs an "
+                      "updated profile; ask the customer to confirm their expected monthly activity and the reason for "
+                      "the change." % (a["alert_id"], fmt(m.get("received_gbp") or 0), m.get("multiple") or 0,
+                                       fmt(m.get("baseline_gbp") or 0), ", ".join(docs), OWN_ACCOUNT_RFI_MULTIPLE))
+            cs.fire("R_OWN_ACCOUNT_PROFILE_UPDATE", "RFI_UPDATED_PROFILE", [])
+            return "RFI_UPDATED_PROFILE", reason, [a["alert_id"]] + docs, trace
+    # 5. CLOSE: every alert reconciled
+    codes = set(e.code for e in expls)
+    if any(r.get("list_status") == "cleared" for r in recs):
+        codes.add("LIST_MATCH_DIFFERENT_PARTY")
+    if cs.alerts_of("TM07") and cs.of_type("reverification_record"):
+        codes.add("RETURNING_CUSTOMER")
+    if not codes:
+        codes.add("WITHIN_PROFILE")
+    code = [c for c in CLOSE_PRIORITY if c in codes][0]
+    sents = [CLOSE_LEAD[code]]
+    ev = []
+    if code == "LIST_MATCH_DIFFERENT_PARTY":
+        for res in tm22:
+            if res["status"] == "cleared":
+                sents.append(res["note"][0].upper() + res["note"][1:] + ".")
+                ev += [res["entry"]] + res["docs"]
+    if code == "RETURNING_CUSTOMER":
+        rv = cs.of_type("reverification_record")[0]
+        sents.append("%s records the re-verification of %s." % (rv.id, cs.cname))
+        ev.append(rv.id)
+    used = [e for e in expls if e.code == code] + [e for e in expls if e.code != code]
+    groups = []
+    for e in used:
+        g = [x for x in groups if set(x[0].txns) == set(e.txns) and x[0].code == e.code]
+        if g:
+            g[0].append(e)
+        else:
+            groups.append([e])
+    for g in groups[:2]:
+        e = g[0]
+        if len(g) > 1:
+            e = Expl(e.code, e.rule, [d for x in g for d in x.docs], e.txns,
+                     " and ".join(x.note for x in g))
+        sents.append(expl_sentence(cs, e))
+        ev += e.docs + e.txns[:6]
+    prof = sorted(set(cs.profile_explained(cs.t(t)) for t in cs.alerted if cs.t(t) and cs.profile_explained(cs.t(t))))
+    if prof and len(sents) < 4:
+        sents.append("Remaining alerted items are %s." % ", ".join(prof))
+    if len(sents) < 2:
+        sents.append("Alerts %s reconcile with nothing left unexplained." % case_alert_summary(cs))
+    ev += [r["alert_id"] for r in recs]
+    cs.fire("R_CLOSE", code, [])
+    return code, " ".join(sents[:4]), ev, trace
+
+
+
+# ----------------------------------------------------------------------------
+# Reason length guard: 2-4 sentences, counted robustly
+# ----------------------------------------------------------------------------
+_ABBR = re.compile(r"\b(?:Sp\. z o\.o\.|e\.g\.|i\.e\.|etc\.|No\.|NO\.|INV\.|Co\.|Ltd\.|Inc\.|St\.|Mr\.|Mrs\.|Ms\.|Dr\.|vs\.|"
+                   r"approx\.|S\.A\.|S\.L\.|B\.V\.|N\.V\.|A\.S\.|L\.L\.C\.)", re.I)
+
+
+def split_sentences(text):
+    """Split into sentences, ignoring dots inside quotes, parentheses, abbreviations and numbers."""
+    mask = list(text)
+    def blank(a, b):
+        for i in range(a, b):
+            if mask[i] in ".!?":
+                mask[i] = "_"
+    for m in re.finditer(r'"[^"]*"|\([^()]*\)|\d\.\d', text):
+        blank(m.start(), m.end())
+    for m in _ABBR.finditer(text):
+        blank(m.start(), m.end())
+    masked = "".join(mask)
+    out, start = [], 0
+    for m in re.finditer(r"[.!?](?=\s+[A-Z0-9£\"(]|\s*$)", masked):
+        out.append(text[start:m.end()].strip())
+        start = m.end()
+    if text[start:].strip():
+        out.append(text[start:].strip())
+    return [x for x in out if x]
+
+
+def clamp_reason(reason, cs):
+    ss = split_sentences(reason)
+    if len(ss) > 4:
+        head, tail = ss[:3], ss[3:]
+        merged = "; ".join(x.rstrip(".") for x in tail) + "."
+        ss = head + [merged]
+    if len(ss) < 2:
+        ss.append("Alerts reviewed: %s." % case_alert_summary(cs))
+    return " ".join(ss)
+
+
+def advisory_reconcile(cs, trace):
+    """For cases decided before reconciliation (suspicion or a confirmed list match), still book the alerted
+    pounds against the evidence, for the trace only. It never changes the verdict; firings are marked advisory."""
+    cands = cs.window_txns()
+    expls = []
+    for x in EXPLAINERS:
+        for e in x(cs, cands):
+            expls.append(e)
+            fid = cs.fact("explains", e.docs + e.txns, code=e.code, rule=e.rule)
+            cs.fire(e.rule, e.code, [fid], docs=e.docs, txns=e.txns, advisory=True)
+            for d in e.docs:
+                for t in e.txns:
+                    cs.edge(d, t, "explains")
+    covered = {}
+    for e in expls:
+        for t in e.txns:
+            covered.setdefault(t, []).append(e)
+    onward = sum(e.onward for e in expls if e.code in ("OWN_ACCOUNT", "INVOICE_MATCHES"))
+    recs = []
+    for a in cs.alerts:
+        rec = reconcile(cs, a, covered, onward)
+        rec["explained_by"] = sorted(set(d for t in a["transaction_ids"] for e in covered.get(t, []) for d in e.docs))
+        rec["advisory"] = True
+        recs.append(rec)
+        cs.fire("R_RECONCILE_%s" % a["rule_id"], "cleared" if rec["cleared"] else "open", [], alert=a["alert_id"],
+                advisory=True)
+    trace["reconciliation"] = recs
+
+
+def decision_index(cs):
+    idx = [i for i, f in enumerate(cs.firings) if not f.get("advisory")]
+    return idx[-1] if idx else len(cs.firings) - 1
+
+
+def fallback(cs, err):
+    text = ""
+    try:
+        text = " ".join(d.body for d in cs.sig_docs)
+    except Exception:
+        pass
+    if SUSPICION_WORDS.search(text):
+        return "ESC_UNEXPLAINED_FUNDS", "Automated review could not complete; documents contain suspicion indicators."
+    return "RFI_SOURCE_OF_FUNDS", ("Automated review could not reconcile the alerted activity; ask the customer for "
+                                   "evidence of the source and purpose of the alerted funds.")
+
+
+# ----------------------------------------------------------------------------
+# Output
+# ----------------------------------------------------------------------------
+def finalize_evidence(cs, ev, code):
+    ev = [e for e in ev if e in cs.valid_ids]
+    if cs.held and cs.held in cs.valid_ids:
+        ev.append(cs.held)
+    ev = [e for e in ev if e != cs.c["customer_id"] and e != cs.id]
+    return sorted(set(ev))
+
+
+def build_trace(cs, code, verdict, ev, extra):
+    nodes = [{"id": cs.c["customer_id"], "type": "customer", "label": cs.cname}]
+    for a in cs.alerts:
+        nodes.append({"id": a["alert_id"], "type": "alert", "label": a["rule_id"]})
+        cs.edge(a["alert_id"], cs.c["customer_id"], "fired_on")
+        for t in a.get("transaction_ids", []):
+            cs.edge(a["alert_id"], t, "fired_on")
+    seen = set()
+    for t in cs.alerted + ([cs.held] if cs.held else []):
+        if t in cs.tx and t not in seen:
+            seen.add(t)
+            x = cs.tx[t]
+            nodes.append({"id": t, "type": "transaction", "label": describe_txn(x)})
+    for d in cs.docs:
+        nodes.append({"id": d.id, "type": "document", "label": d.type})
+    for le, L in sorted(cs.list_entries.items()):
+        nodes.append({"id": le, "type": "list_entry", "label": L.get("name")})
+    for i, f in enumerate(cs.firings):
+        nodes.append({"id": "R%d" % (i + 1), "type": "rule", "label": f["rule"], "outcome": f["outcome"]})
+        if f.get("alert"):
+            cs.edge(f["alert"], "R%d" % (i + 1), "fired_on")
+        for d in f.get("docs", []):
+            cs.edge(d, "R%d" % (i + 1), "supports")
+        for fid in f["facts"]:
+            if fid:
+                for fact in cs.facts:
+                    if fact["id"] == fid:
+                        for s in fact["sources"]:
+                            cs.edge(s, "R%d" % (i + 1), "supports")
+    nodes.append({"id": "VERDICT", "type": "verdict", "label": "%s / %s" % (verdict, code)})
+    for e in ev:
+        cs.edge(e, "VERDICT", "supports")
+    di = decision_index(cs)
+    for i, f in enumerate(cs.firings):
+        if (f["rule"].startswith("R_RECONCILE") and not f.get("advisory")) or i == di:
+            cs.edge("R%d" % (i + 1), "VERDICT", "supports" if f["outcome"] != "open" or verdict != "CLOSE" else "contradicts")
+    known = set(n["id"] for n in nodes)
+    edges = [{"from": s, "to": d, "rel": r} for s, d, r in cs.edges]
+    for e in edges:
+        for k in ("from", "to"):
+            if e[k] not in known:
+                known.add(e[k])
+                nodes.append({"id": e[k], "type": "transaction" if e[k] in cs.tx else "record", "label": e[k]})
+    for n in nodes:
+        n["class"] = node_class(n, cs)
+    for e in edges:
+        e["property"] = EDGE_PROP.get(e["rel"], e["rel"])
+    return {"case_id": cs.id, "verdict": verdict, "reason_code": code, "nodes": nodes, "edges": edges,
+            "facts": cs.facts, "firings": cs.firings, "reconciliation": extra.get("reconciliation", []),
+            "list_resolution": extra.get("tm22", [])}
+
+
+
+# ----------------------------------------------------------------------------
+# Ontology vocabulary (system/ontology/proof.owl) used by the trace and the RDF export
+# ----------------------------------------------------------------------------
+ONTO_NS = "https://proof.example/ontology#"
+NODE_CLASS = {"customer": "Customer", "alert": "Alert", "transaction": "Transaction", "document": "Document",
+              "list_entry": "ListEntry", "rule": "ReasoningRule", "verdict": "Verdict", "record": "Document"}
+EDGE_PROP = {"fired_on": "firedOn", "supports": "supports", "contradicts": "contradicts",
+             "matches": "matchesListEntry", "explains": "explains", "holds": "hasEvidence"}
+DOC_CLASS = {
+    "invoice": "Invoice", "supplier_invoice": "Invoice", "supplier_invoices": "Invoice", "dealer_invoice": "Invoice",
+    "hospital_invoice": "Invoice", "carrier_invoice": "Invoice", "receipt": "Invoice", "credit_note": "Invoice",
+    "purchase_order": "Invoice", "contract_schedule": "Invoice", "supply_contract": "Invoice",
+    "consulting_contract": "Invoice", "sale_receipt": "Invoice", "vehicle_sale_receipt": "EventDoc",
+    "bank_statement": "AccountProof",
+    "solicitor_letter": "EventDoc", "insurer_letter": "EventDoc", "settlement_letter": "EventDoc",
+    "completion_statement": "EventDoc", "deposit_return_letter": "EventDoc", "holding_deposit_receipt": "EventDoc",
+    "loan_agreement": "EventDoc", "redundancy_letter": "EventDoc", "cancellation_confirmation": "EventDoc",
+    "venue_email": "EventDoc", "insurance_schedule": "EventDoc", "employment_contract": "EventDoc", "advert": "EventDoc",
+    "gift_letter": "ThirdPartyDoc", "factoring_agreement": "ThirdPartyDoc", "remittance_advice": "ThirdPartyDoc",
+    "booking_confirmation": "BusinessRecord", "cash_collection_reports": "BusinessRecord",
+    "cash_handling_procedure": "BusinessRecord", "cash_reconciliation": "BusinessRecord", "takings_book": "BusinessRecord",
+    "freight_invoices": "BusinessRecord", "payment_file": "BusinessRecord", "management_accounts": "BusinessRecord",
+    "ticket_report": "BusinessRecord",
+    "company_register_extract": "CompanyRegister", "significant_control_register": "ControlRegister",
+    "group_structure": "GroupStructure",
+    "sending_bank_fraud_report": "ScamReport",
+    "support_chat": "Correspondence", "customer_email": "Correspondence", "customer_letter": "Correspondence",
+    "email": "Correspondence", "staff_note": "StaffNote", "contact_note": "Correspondence",
+    "due_diligence_summary": "IdentityRecord", "proof_of_address": "IdentityRecord",
+    "reverification_record": "IdentityRecord", "device_export": "DeviceRecord",
+}
+
+
+def rule_class(name):
+    if re.match(r"S\d+_", name):
+        return "SuspicionRule"
+    if name.startswith("R_TM22"):
+        return "ListResolutionRule"
+    if re.match(r"X\d+_", name):
+        return "ExplanationRule"
+    if name.startswith("R_RECONCILE"):
+        return "ReconciliationRule"
+    return "DecisionRule"
+
+
+def node_class(n, cs):
+    if n["type"] == "document":
+        return DOC_CLASS.get(n.get("label"), "Document")
+    if n["type"] == "record":
+        if any(r["review_id"] == n["id"] for r in cs.reviews):
+            return "PriorReview"
+        if n["id"] in cs.tx:
+            return "Transaction"
+        return "Document"
+    if n["type"] == "rule":
+        return rule_class(n.get("label", ""))
+    return NODE_CLASS.get(n["type"], "Document")
+
+
+def _lit(v):
+    if isinstance(v, bool):
+        return '"%s"^^xsd:boolean' % ("true" if v else "false")
+    if isinstance(v, (int, float)):
+        return '"%.2f"^^xsd:decimal' % v
+    s = str(v)
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        return '"%s"^^xsd:date' % s
+    return json.dumps(s, ensure_ascii=False)
+
+
+def _iri(x):
+    return "pd:" + re.sub(r"[^A-Za-z0-9_\-]", "_", str(x))
+
+
+def kg_triples(cs, tr, out):
+    """Asserted facts + engine conclusions for one case, as Turtle triple lines (sorted by caller)."""
+    T = set()
+    cid = cs.id
+    loc = lambda x: _iri(cid + "_" + x) if x in ("VERDICT",) or re.fullmatch(r"[RF]\d+", x) else _iri(x)
+    add = lambda s_, p_, o_: T.add("%s %s %s ." % (s_, p_, o_))
+    case = _iri(cid)
+    add(case, "a", "proof:Case")
+    add(case, "proof:sourceId", _lit(cid))
+    add(case, "proof:concerns", _iri(cs.c["customer_id"]))
+    add(case, "proof:hasVerdict", loc("VERDICT"))
+    if cs.held:
+        add(case, "proof:heldPayment", _iri(cs.held))
+    for n in tr["nodes"]:
+        s_ = loc(n["id"])
+        add(s_, "a", "proof:" + node_class(n, cs))
+        add(s_, "proof:sourceId", _lit(n["id"]))
+        if n["type"] == "customer":
+            add(s_, "proof:name", _lit(cs.cname))
+            add(s_, "proof:partyKind", _lit(cs.cust.get("kind") or ""))
+            for acc in sorted(set(t.get("account_id") for t in cs.all_txns if t.get("account_id"))):
+                add(s_, "proof:holdsAccount", _iri(acc))
+                add(_iri(acc), "a", "proof:Account")
+        elif n["type"] == "alert":
+            add(case, "proof:hasAlert", s_)
+            a = [x for x in cs.alerts if x["alert_id"] == n["id"]]
+            if a:
+                add(s_, "proof:ruleId", _lit(a[0]["rule_id"]))
+                add(s_, "proof:triggeredBy", "proof:" + re.sub(r"\W", "_", a[0]["rule_id"]))
+        elif n["id"] in cs.tx:
+            t = cs.tx[n["id"]]
+            add(s_, "proof:amount", _lit(float(t["amount_gbp"])))
+            add(s_, "proof:date", _lit((t.get("booked_at") or "")[:10]))
+            add(s_, "proof:direction", _lit(t["direction"]))
+            add(s_, "proof:channel", _lit(t.get("channel") or ""))
+            if t.get("reference"):
+                add(s_, "proof:reference", _lit(t["reference"]))
+            if t.get("account_id"):
+                add(s_, "proof:onAccount", _iri(t["account_id"]))
+            if t.get("counterparty_name"):
+                cp = _iri("CP_" + norm(t["counterparty_name"]).replace(" ", "_"))
+                add(s_, "proof:hasCounterparty", cp)
+                add(cp, "a", "proof:Customer" if cs.is_self(t["counterparty_name"]) else "proof:Counterparty")
+                add(cp, "proof:name", _lit(t["counterparty_name"]))
+                if t.get("counterparty_country"):
+                    add(cp, "proof:country", _lit(t["counterparty_country"]))
+        elif n["type"] == "document":
+            add(s_, "proof:docType", _lit(n.get("label") or ""))
+            add(_iri(cs.c["customer_id"]), "proof:hasEvidence", s_)
+            d = [x for x in cs.docs if x.id == n["id"]]
+            if d and d[0].dated:
+                add(s_, "proof:date", _lit(d[0].dated.isoformat()))
+        elif n["type"] == "list_entry":
+            add(s_, "proof:name", _lit(n.get("label") or ""))
+        elif n["type"] == "rule":
+            add(s_, "proof:ruleName", _lit(n.get("label") or ""))
+            add(s_, "proof:outcome", _lit(n.get("outcome") or ""))
+    for i, f in enumerate(tr["firings"]):
+        for fid in f.get("facts") or []:
+            if fid:
+                add(loc("R%d" % (i + 1)), "proof:usesFact", loc(fid))
+    for f in tr["facts"]:
+        s_ = loc(f["id"])
+        add(s_, "a", "proof:Fact")
+        add(s_, "proof:factKind", _lit(f["kind"]))
+        for src in f["sources"]:
+            add(s_, "proof:hasSource", _iri(src))
+        for k in sorted(f):
+            if k not in ("id", "kind", "sources") and f[k] is not None:
+                add(s_, "proof:factValue", _lit("%s=%s" % (k, f[k])))
+    for e in tr["edges"]:
+        add(loc(e["from"]), "proof:" + EDGE_PROP.get(e["rel"], e["rel"]), loc(e["to"]))
+    v = loc("VERDICT")
+    add(v, "proof:verdictValue", _lit(out["verdict"]))
+    add(v, "proof:verdictOf", "proof:" + out["verdict"])
+    add(v, "proof:hasReasonCode", "proof:" + out["reason_code"])
+    add(v, "proof:reasonText", _lit(out["reason"]))
+    if tr["firings"]:
+        add(v, "proof:decidedBy", loc("R%d" % (decision_index(cs) + 1)))
+    for eid in out["evidence"]:
+        add(_iri(eid), "proof:citedAs", v)
+    for r in tr.get("reconciliation", []):
+        rn = _iri(cid + "_recon_" + r["alert_id"])
+        add(rn, "a", "proof:Reconciliation")
+        add(_iri(r["alert_id"]), "proof:hasReconciliation", rn)
+        add(rn, "proof:alertedAmount", _lit(float(r["alerted_gbp"])))
+        add(rn, "proof:explainedAmount", _lit(float(r["explained_gbp"])))
+        add(rn, "proof:profileAmount", _lit(float(r.get("profile_gbp") or 0)))
+        add(rn, "proof:unexplainedAmount", _lit(float(r["unexplained_gbp"])))
+        add(rn, "proof:cleared", _lit(bool(r["cleared"])))
+        if r.get("list_status"):
+            add(rn, "proof:listStatus", _lit(r["list_status"]))
+        for d in r.get("explained_by", []):
+            add(rn, "proof:explainedBy", _iri(d))
+        for t in r.get("unexplained_txns", []):
+            add(rn, "proof:unexplainedTxn", _iri(t))
+    return T
+
+
+TTL_HEADER = ("@prefix proof: <%s> .\n@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n"
+              "@prefix pd: <https://proof.example/data/%s/> .\n\n")
+
+
+def run_case(world, case, want_kg=False):
+    cs = Case(world, case)
+    try:
+        code, reason, ev, extra = decide(cs)
+        fell = False
+        if not extra.get("reconciliation"):
+            advisory_reconcile(cs, extra)
+    except Exception as err:  # never CLOSE on failure
+        code, reason = fallback(cs, err)
+        ev, extra, fell = [a["alert_id"] for a in cs.alerts], {"error": repr(err)}, True
+    verdict = VERDICT_OF.get(code, "ESCALATE")
+    reason = clamp_reason(reason, cs)
+    ev = finalize_evidence(cs, ev, code)
+    if not ev:
+        ev = sorted(a["alert_id"] for a in cs.alerts)
+    out = {"case_id": cs.id, "alert_ids": list(case.get("alert_ids", [])), "verdict": verdict, "reason_code": code,
+           "reason": reason, "evidence": ev}
+    tr = build_trace(cs, code, verdict, ev, extra)
+    tr["fallback"] = fell
+    if fell:
+        tr["error"] = extra.get("error")
+    if want_kg:
+        tr["_kg"] = kg_triples(cs, tr, out)
+    return out, tr, fell
+
+
+def main(argv):
+    args = [a for a in argv[1:] if not a.startswith("--")]
+    trace = "--trace" in argv
+    if len(args) != 2:
+        sys.stderr.write("usage: run <institution_folder> <output.jsonl> [--trace]\n")
+        return 2
+    folder, outp = args
+    world = World(folder)
+    lines, tlines, kg, falls = [], [], set(), 0
+    for case in world.cases:
+        try:
+            o, tr, fell = run_case(world, case, trace)
+        except Exception as err:
+            o = {"case_id": case.get("case_id"), "alert_ids": list(case.get("alert_ids", [])), "verdict": "RFI",
+                 "reason_code": "RFI_SOURCE_OF_FUNDS",
+                 "reason": "Automated review could not complete; ask the customer for evidence of the source and "
+                           "purpose of the alerted funds.", "evidence": sorted(case.get("alert_ids", []))}
+            tr, fell = {"case_id": case.get("case_id"), "fallback": True, "error": repr(err)}, True
+        falls += fell
+        kg |= tr.pop("_kg", set())
+        lines.append(json.dumps(o, ensure_ascii=False))
+        tlines.append(json.dumps(tr, ensure_ascii=False, sort_keys=True))
+    with open(outp, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + ("\n" if lines else ""))
+    if trace:
+        with open(outp + ".trace.jsonl", "w", encoding="utf-8") as fh:
+            fh.write("\n".join(tlines) + ("\n" if tlines else ""))
+        with open(outp + ".kg.ttl", "w", encoding="utf-8") as fh:
+            fh.write(TTL_HEADER % (ONTO_NS, re.sub(r"\W", "_", world.inst)))
+            fh.write("\n".join(sorted(kg)) + "\n")
+    sys.stderr.write("%d cases, %d fallback\n" % (len(lines), falls))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,0 +1,149 @@
+@prefix proof: <https://proof.example/ontology#> .
+@prefix owl:   <http://www.w3.org/2002/07/owl#> .
+@prefix rdf:   <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:   <http://www.w3.org/2001/XMLSchema#> .
+
+# PROOF ontology: the vocabulary of the alert-triage knowledge graph.
+# OWL defines the terms; the closed-world rules engine (system/run, Datalog-style) makes the
+# decisions; each case is exported back as an OWL-typed graph (output/<inst>.jsonl.kg.ttl).
+
+<https://proof.example/ontology> a owl:Ontology ;
+    rdfs:label "PROOF transaction-monitoring triage ontology" ;
+    owl:versionInfo "1.0" .
+
+# ---------------------------------------------------------------- classes
+proof:Case            a owl:Class ; rdfs:label "Case" ; rdfs:comment "One triage case: a customer and the alerts raised on them." .
+proof:Party           a owl:Class ; rdfs:label "Party" .
+proof:Customer        a owl:Class ; rdfs:subClassOf proof:Party ; rdfs:label "Customer" .
+proof:Counterparty    a owl:Class ; rdfs:subClassOf proof:Party ; rdfs:label "Counterparty" .
+proof:Account         a owl:Class ; rdfs:label "Account" .
+proof:Transaction     a owl:Class ; rdfs:label "Transaction" .
+proof:Alert           a owl:Class ; rdfs:label "Alert" .
+proof:ListEntry       a owl:Class ; rdfs:label "Internal list entry" .
+proof:Fact            a owl:Class ; rdfs:label "Fact" ; rdfs:comment "An atomic statement extracted from source records; always carries its source IDs." .
+proof:Reconciliation  a owl:Class ; rdfs:label "Reconciliation" ; rdfs:comment "Alerted pounds vs pounds explained by evidence, for one alert." .
+proof:Verdict         a owl:Class ; rdfs:label "Verdict" .
+proof:ReasonCode      a owl:Class ; rdfs:label "Reason code" .
+
+proof:Rule                a owl:Class ; rdfs:label "Rule" .
+proof:MonitoringRule      a owl:Class ; rdfs:subClassOf proof:Rule ; rdfs:label "Monitoring rule (TMxx)" .
+proof:ReasoningRule       a owl:Class ; rdfs:subClassOf proof:Rule ; rdfs:label "Reasoning rule (fired by the engine)" .
+proof:SuspicionRule       a owl:Class ; rdfs:subClassOf proof:ReasoningRule ; rdfs:label "Suspicion rule" .
+proof:ListResolutionRule  a owl:Class ; rdfs:subClassOf proof:ReasoningRule ; rdfs:label "List resolution rule" .
+proof:ExplanationRule     a owl:Class ; rdfs:subClassOf proof:ReasoningRule ; rdfs:label "Explanation rule" .
+proof:ReconciliationRule  a owl:Class ; rdfs:subClassOf proof:ReasoningRule ; rdfs:label "Reconciliation rule" .
+proof:DecisionRule        a owl:Class ; rdfs:subClassOf proof:ReasoningRule ; rdfs:label "Decision rule" .
+
+proof:Document        a owl:Class ; rdfs:label "Document" .
+proof:Invoice         a owl:Class ; rdfs:subClassOf proof:Document ; rdfs:label "Invoice / commercial document" .
+proof:AccountProof    a owl:Class ; rdfs:subClassOf proof:Document ; rdfs:label "Account proof (statement)" .
+proof:EventDoc        a owl:Class ; rdfs:subClassOf proof:Document ; rdfs:label "One-off event document" .
+proof:ThirdPartyDoc   a owl:Class ; rdfs:subClassOf proof:Document ; rdfs:label "Third-party funding document" .
+proof:BusinessRecord  a owl:Class ; rdfs:subClassOf proof:Document ; rdfs:label "Business record" .
+proof:RegistryRecord  a owl:Class ; rdfs:subClassOf proof:Document ; rdfs:label "Registry record" .
+proof:CompanyRegister a owl:Class ; rdfs:subClassOf proof:RegistryRecord ; rdfs:label "Company register extract" .
+proof:ControlRegister a owl:Class ; rdfs:subClassOf proof:RegistryRecord ; rdfs:label "Significant-control register" .
+proof:GroupStructure  a owl:Class ; rdfs:subClassOf proof:RegistryRecord ; rdfs:label "Group structure" .
+proof:PriorReview     a owl:Class ; rdfs:subClassOf proof:Document ; rdfs:label "Prior review" .
+proof:ScamReport      a owl:Class ; rdfs:subClassOf proof:Document ; rdfs:label "Sending-bank scam report" .
+proof:Correspondence  a owl:Class ; rdfs:subClassOf proof:Document ; rdfs:label "Correspondence (chat, email, letter)" .
+proof:StaffNote       a owl:Class ; rdfs:subClassOf proof:Document ; rdfs:label "Staff note" .
+proof:IdentityRecord  a owl:Class ; rdfs:subClassOf proof:Document ; rdfs:label "Identity / KYC record" .
+proof:DeviceRecord    a owl:Class ; rdfs:subClassOf proof:Document ; rdfs:label "Device export" .
+
+proof:Document owl:disjointWith proof:Transaction .
+proof:Customer owl:disjointWith proof:Counterparty .
+
+# ---------------------------------------------------------------- object properties
+proof:hasAlert          a owl:ObjectProperty ; rdfs:domain proof:Case ; rdfs:range proof:Alert .
+proof:concerns          a owl:ObjectProperty ; rdfs:domain proof:Case ; rdfs:range proof:Customer .
+proof:hasVerdict        a owl:ObjectProperty ; rdfs:domain proof:Case ; rdfs:range proof:Verdict .
+proof:firedOn           a owl:ObjectProperty ; rdfs:domain proof:Alert ; rdfs:comment "An alert fired on a customer or transaction." .
+proof:triggeredBy       a owl:ObjectProperty ; rdfs:domain proof:Alert ; rdfs:range proof:MonitoringRule .
+proof:holdsAccount      a owl:ObjectProperty ; rdfs:domain proof:Party ; rdfs:range proof:Account .
+proof:onAccount         a owl:ObjectProperty ; rdfs:domain proof:Transaction ; rdfs:range proof:Account .
+proof:hasCounterparty   a owl:ObjectProperty ; rdfs:domain proof:Transaction ; rdfs:range proof:Counterparty .
+proof:hasEvidence       a owl:ObjectProperty ; rdfs:domain proof:Customer ; rdfs:range proof:Document .
+proof:explains          a owl:ObjectProperty ; rdfs:domain proof:Document ; rdfs:range proof:Transaction .
+proof:supports          a owl:ObjectProperty ; rdfs:comment "Source supports a rule, a list match or the verdict." .
+proof:contradicts       a owl:ObjectProperty ; rdfs:comment "Source contradicts another record or a candidate conclusion." .
+proof:matchesListEntry  a owl:ObjectProperty ; rdfs:domain proof:Alert ; rdfs:range proof:ListEntry .
+proof:citedAs           a owl:ObjectProperty ; rdfs:range proof:Verdict ; rdfs:comment "Record is cited as evidence for the verdict." .
+proof:decidedBy         a owl:ObjectProperty ; rdfs:domain proof:Verdict ; rdfs:range proof:ReasoningRule .
+proof:hasReasonCode     a owl:ObjectProperty ; rdfs:domain proof:Verdict ; rdfs:range proof:ReasonCode .
+proof:usesFact          a owl:ObjectProperty ; rdfs:domain proof:ReasoningRule ; rdfs:range proof:Fact .
+proof:hasSource         a owl:ObjectProperty ; rdfs:domain proof:Fact .
+proof:hasReconciliation a owl:ObjectProperty ; rdfs:domain proof:Alert ; rdfs:range proof:Reconciliation .
+proof:explainedBy       a owl:ObjectProperty ; rdfs:domain proof:Reconciliation ; rdfs:range proof:Document .
+proof:unexplainedTxn    a owl:ObjectProperty ; rdfs:domain proof:Reconciliation ; rdfs:range proof:Transaction .
+proof:heldPayment       a owl:ObjectProperty ; rdfs:domain proof:Case ; rdfs:range proof:Transaction .
+
+# ---------------------------------------------------------------- data properties
+proof:sourceId          a owl:DatatypeProperty ; rdfs:range xsd:string .
+proof:name              a owl:DatatypeProperty ; rdfs:range xsd:string .
+proof:amount            a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:comment "GBP amount." .
+proof:date              a owl:DatatypeProperty ; rdfs:range xsd:date .
+proof:direction         a owl:DatatypeProperty ; rdfs:range xsd:string .
+proof:channel           a owl:DatatypeProperty ; rdfs:range xsd:string .
+proof:reference         a owl:DatatypeProperty ; rdfs:range xsd:string .
+proof:country           a owl:DatatypeProperty ; rdfs:range xsd:string .
+proof:partyKind         a owl:DatatypeProperty ; rdfs:range xsd:string .
+proof:docType           a owl:DatatypeProperty ; rdfs:range xsd:string .
+proof:ruleId            a owl:DatatypeProperty ; rdfs:range xsd:string .
+proof:ruleName          a owl:DatatypeProperty ; rdfs:range xsd:string .
+proof:outcome           a owl:DatatypeProperty ; rdfs:range xsd:string .
+proof:factKind          a owl:DatatypeProperty ; rdfs:range xsd:string .
+proof:factValue         a owl:DatatypeProperty ; rdfs:range xsd:string .
+proof:verdictValue      a owl:DatatypeProperty ; rdfs:range xsd:string .
+proof:reasonText        a owl:DatatypeProperty ; rdfs:range xsd:string .
+proof:alertedAmount     a owl:DatatypeProperty ; rdfs:range xsd:decimal .
+proof:explainedAmount   a owl:DatatypeProperty ; rdfs:range xsd:decimal .
+proof:profileAmount     a owl:DatatypeProperty ; rdfs:range xsd:decimal .
+proof:unexplainedAmount a owl:DatatypeProperty ; rdfs:range xsd:decimal .
+proof:cleared           a owl:DatatypeProperty ; rdfs:range xsd:boolean .
+proof:listStatus        a owl:DatatypeProperty ; rdfs:range xsd:string .
+
+# ---------------------------------------------------------------- verdict values and reason codes
+proof:allowedFor a owl:ObjectProperty ; rdfs:domain proof:ReasonCode ; rdfs:range proof:VerdictValue .
+proof:VerdictValue a owl:Class ; rdfs:label "Verdict value" .
+proof:CLOSE a owl:NamedIndividual , proof:VerdictValue .
+proof:RFI a owl:NamedIndividual , proof:VerdictValue .
+proof:ESCALATE a owl:NamedIndividual , proof:VerdictValue .
+proof:verdictOf a owl:ObjectProperty ; rdfs:domain proof:Verdict ; rdfs:range proof:VerdictValue .
+proof:COLLECTION_DOCUMENTED a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:CLOSE .
+proof:BUSINESS_RECORDS_RECONCILE a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:CLOSE .
+proof:DOCUMENTED_EVENT a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:CLOSE .
+proof:INVOICE_MATCHES a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:CLOSE .
+proof:OWN_ACCOUNT a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:CLOSE .
+proof:GROUP_COMPANY a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:CLOSE .
+proof:THIRD_PARTY_DOCUMENTED a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:CLOSE .
+proof:REFUND_OF_EARLIER_PAYMENT a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:CLOSE .
+proof:RETURNING_CUSTOMER a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:CLOSE .
+proof:LIST_MATCH_DIFFERENT_PARTY a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:CLOSE .
+proof:WITHIN_PROFILE a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:CLOSE .
+proof:RFI_PURPOSE_DOCUMENTS a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:RFI .
+proof:RFI_BUSINESS_RECORDS a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:RFI .
+proof:RFI_SOURCE_OF_FUNDS a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:RFI .
+proof:RFI_COUNTERPARTY_DETAILS a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:RFI .
+proof:RFI_UPDATED_PROFILE a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:RFI .
+proof:ESC_MULE_ACTIVITY a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:ESCALATE .
+proof:ESC_STRUCTURING a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:ESCALATE .
+proof:ESC_UNEXPLAINED_FUNDS a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:ESCALATE .
+proof:ESC_PASS_THROUGH a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:ESCALATE .
+proof:ESC_INVOICE_MISMATCH a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:ESCALATE .
+proof:ESC_HIGH_RISK_CORRIDOR a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:ESCALATE .
+proof:ESC_ACCOUNT_MISUSE a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:ESCALATE .
+proof:ESC_THIRD_PARTY_FUNDING a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:ESCALATE .
+proof:ESC_EARLY_REDEMPTION a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:ESCALATE .
+proof:ESC_LISTED_PARTY a owl:NamedIndividual , proof:ReasonCode ; proof:allowedFor proof:ESCALATE .
+proof:TM01 a owl:NamedIndividual , proof:MonitoringRule .
+proof:TM02 a owl:NamedIndividual , proof:MonitoringRule .
+proof:TM03 a owl:NamedIndividual , proof:MonitoringRule .
+proof:TM04 a owl:NamedIndividual , proof:MonitoringRule .
+proof:TM05 a owl:NamedIndividual , proof:MonitoringRule .
+proof:TM06 a owl:NamedIndividual , proof:MonitoringRule .
+proof:TM07 a owl:NamedIndividual , proof:MonitoringRule .
+proof:TM08 a owl:NamedIndividual , proof:MonitoringRule .
+proof:TM10 a owl:NamedIndividual , proof:MonitoringRule .
+proof:TM22 a owl:NamedIndividual , proof:MonitoringRule .
