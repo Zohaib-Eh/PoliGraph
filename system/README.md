@@ -11,11 +11,24 @@ Speed: 200 cases take about 1 s and 1,000 cases about 2.5 s. All 4,000 dev cases
 
 ## 1. How it reasons
 
-```
- case folder ──► normalise ──► reconcile every alert ──► red-flag rules ──► verdict ladder ──► reason + evidence IDs
- (cases, alerts,  (dates, money,  (each alerted £ must be   (list matches,      ESCALATE if any red flag
-  txns, docs,      names, tables,  matched to a document:   proxy handovers,    RFI if anything unsettled
-  POLICY.md)       labels)         exact penny + payee/date) contradictions…)   CLOSE only if £0 unexplained
+```mermaid
+flowchart TD
+    A["Load case folder<br/>cases, alerts, transactions,<br/>documents, internal list, POLICY.md"] --> B["Normalise<br/>dates, money, names, tables"]
+    B --> C["Reconcile each alert<br/>every alerted pound vs documents:<br/>exact penny + payee/date checks"]
+    C --> D["Red-flag rules<br/>list matches incl. proxy handovers,<br/>contradicting docs, docs in another name,<br/>high-risk countries, scam reports"]
+    D --> E{"Verdict ladder"}
+    E -->|"any red flag"| X["ESCALATE"]
+    E -->|"anything unsettled"| R["RFI<br/>asks for the missing document"]
+    E -->|"0 GBP unexplained, no red flag"| K["CLOSE"]
+    X --> O["2-4 sentence reason<br/>+ evidence IDs"]
+    R --> O
+    K --> O
+    classDef esc fill:#3a1418,stroke:#f0506e,color:#ffd6dc
+    classDef rfi fill:#3a2e10,stroke:#f5b83d,color:#ffe9b8
+    classDef ok fill:#0f3324,stroke:#35d07f,color:#c9f5dc
+    class X esc
+    class R rfi
+    class K ok
 ```
 1. **Read the case.** Load the customer, the alerts, the transactions, the evidence documents, the internal list and earlier reviews. The engine opens only files inside the institution folder.
 2. **Normalise.** Turn every format into one canonical form with fixed rules (no model involved). This covers dates ("3rd Oct", US dates only when unambiguous), money ("£12k", "12 000,00"), names ("SMITH, John", "Mr J. Smith") and table or bullet layouts.
@@ -36,7 +49,34 @@ Speed: 200 cases take about 1 s and 1,000 cases about 2.5 s. All 4,000 dev cases
 5. **Apply the verdict ladder.** Any red flag means **ESCALATE**. Anything unsettled means **RFI**: an open alert, missing data, an unmatched scam report, or dormant money with no evidenced source. The RFI asks for exactly the missing document. **CLOSE** is reached only when every alert reconciles with £0 unexplained and no red flag. A wrong CLOSE is the costliest error, so the engine never closes on a guess. If a case errors, it falls back to RFI or ESCALATE, never CLOSE.
 6. **Write the reason.** The reason is 2–4 templated sentences giving this case's amounts, dates and document IDs. Every ID it names is in `evidence`.
 
+**Internal-list matches** are settled by who controlled the payee on the payment date:
+
+```mermaid
+flowchart TD
+    M["Alert matches an internal-list entry"] --> T{"Who controlled the payee<br/>on the payment date?"}
+    T -->|"listed person still a controller (PSC)<br/>on that date, incl. exactly 50%"| E1["ESCALATE<br/>ESC_LISTED_PARTY"]
+    T -->|"control ended within 30 days and passed<br/>to a relative or same surname"| E2["ESCALATE<br/>proxy handover"]
+    T -->|"different birth date or unit,<br/>or control ended before with no relative taking over"| C1["Cleared: different party<br/>then reconcile as normal"]
+    T -->|"nothing on file settles it"| R1["RFI<br/>RFI_COUNTERPARTY_DETAILS"]
+    classDef esc fill:#3a1418,stroke:#f0506e,color:#ffd6dc
+    classDef rfi fill:#3a2e10,stroke:#f5b83d,color:#ffe9b8
+    classDef ok fill:#0f3324,stroke:#35d07f,color:#c9f5dc
+    class E1,E2 esc
+    class R1 rfi
+    class C1 ok
+```
+
 **Worked example (dev case BK-CS125943).** Alert BK-AL2932422 matched payee Elmcote Consulting Ltd to list entry BK-L71137 (Emery Draycote) on officer name and birth month. Register REG-6142 shows Draycote resigned as director on 14 September 2026, the day before the payment, which on its own would look like a different party. But PSC register PSC-5155 shows Emery Draycote still held 60% of the shares until 17 September 2026. The £1,800 payment was on 15 September. Policy says a listed party controlling the payee at the time of payment must be escalated, so the verdict is → `ESCALATE / ESC_LISTED_PARTY`, evidence `BK-AL2932422, BK-L71137, BK-T756068985, PSC-5155, REG-6142`.
+
+## What it looks like
+
+The viewer (`viewer/index.html`, works offline from file://) shows every case with its reason, £ reconciliation, evidence and reasoning graph.
+
+| Case decision | Reasoning graph |
+|---|---|
+| ![Case decision](../docs/screenshots/case-decision.png) | ![Reasoning graph](../docs/screenshots/case-why-graph.png) |
+
+More screenshots: [repo README](../README.md#what-it-looks-like).
 
 ## 2. Why this approach
 
