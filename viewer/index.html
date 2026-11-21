@@ -2,85 +2,41 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>PROOF · Analyst workbench</title>
+<title>PoliGraph</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="stylesheet" href="styles.css">
+<link rel="icon" href="data:,">
 </head>
 <body>
-<div class="app">
-  <header>
-    <div class="brand"><b>PROOF<span>Analyst workbench</span></b><i>A reasoning engine, not a guessing engine.</i></div>
-    <div class="seg" id="instSeg" role="tablist" aria-label="Institution"></div>
-    <button class="hbtn" id="replayBtn" title="Stream the queue as a live ops floor">▶ Replay queue</button>
-    <label class="speed" title="Replay speed (cases per second)"><input type="range" id="speed" min="1" max="20" value="4"><span class="mono" id="speedV">4/s</span></label>
-    <label class="hbtn" title="Load a trace (.trace.jsonl) and optionally its output (.jsonl)">Load trace…<input type="file" id="picker" accept=".jsonl,.json" multiple hidden></label>
-    <div class="counters">
-      <div class="ctr"><span class="v" id="cDecided">0</span><span class="k">cases decided</span></div>
-      <div class="ctr c"><span class="v" id="cClose">0</span><span class="k">close</span></div>
-      <div class="ctr r"><span class="v" id="cRfi">0</span><span class="k">rfi</span></div>
-      <div class="ctr e"><span class="v" id="cEsc">0</span><span class="k">escalate</span></div>
-      <div class="ctr h" title="Assumption: 20 minutes of analyst time per auto-closed alert"><span class="v" id="cHours">0</span><span class="k">analyst hrs saved</span><span class="k" style="color:var(--text-faint);text-transform:none;letter-spacing:0">assumes 20 min per auto-closed alert</span></div>
+<div class="shell">
+  <nav class="side" aria-label="Main">
+    <a class="logo" href="#/">
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><circle cx="5" cy="12" r="2.4"/><circle cx="12" cy="5" r="2.4"/><circle cx="12" cy="19" r="2.4"/><circle cx="19" cy="12" r="2.4"/><path d="M7 11l3.4-4.2M7 13l3.4 4.2M14 6.8l3.4 4.2M14 17.2l3.4-4.2"/></svg>
+      <span><b>PoliGraph</b><i>A reasoning engine, not a guessing engine.</i></span>
+    </a>
+    <div class="nav" id="nav">
+      <a href="#/" data-r="overview"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>Overview</a>
+      <a href="#/queue" data-r="queue"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>Queue</a>
+      <a href="#/rules" data-r="rules"><svg viewBox="0 0 24 24"><path d="M6 3v18M6 7h9l-2 3 2 3H6"/></svg>Rules</a>
+      <a href="#/about" data-r="about"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/></svg>How it works</a>
+      <a href="#/import" data-r="import"><svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M4 20h16"/></svg>Import</a>
     </div>
-    <div class="badge" id="badge" tabindex="0" title="Determinism check: verdict + reason code across repeated runs">
-      <div class="t" id="badgeT">5/5 identical runs 🔒</div>
-      <div class="h" id="badgeH">—</div>
-      <div class="pop" id="badgePop"></div>
+    <div class="side-foot">
+      <label class="lbl" for="instSel">Institution</label>
+      <select id="instSel"></select>
+      <div class="repro" id="repro" title="Five independent runs of the engine"></div>
     </div>
-  </header>
-
-  <aside class="queue">
-    <div class="qhead">
-      <div class="label">Queue</div>
-      <div class="chips" id="vchips">
-        <button class="chip on" data-v="ALL">All</button><button class="chip" data-v="CLOSE">CLOSE</button><button class="chip" data-v="RFI">RFI</button><button class="chip" data-v="ESCALATE">ESC</button>
-      </div>
-      <div class="qrow2"><select id="ruleSel" aria-label="Monitoring rule"></select><select id="codeSel" aria-label="Reason code"></select></div>
-      <input id="search" placeholder="Search case ID or customer…" autocomplete="off">
-      <label class="cust"><input type="checkbox" id="detailOnly"> graph-ready cases only</label>
-    </div>
-    <div class="pins" id="pins"><span class="label">★ Demo cases</span></div>
-    <div class="qlist" id="qlist" tabindex="0"></div>
-    <div class="qfoot"><span id="qcount">0 shown</span><span id="qsplit"></span></div>
-  </aside>
-
-  <main class="centre">
-    <div class="gbar">
-      <span class="label">Ontology knowledge graph</span>
-      <span class="title" id="gTitle"></span><span class="sub" id="gSub"></span>
-      <span class="sp"></span>
-      <span class="sub mono" id="gSel"></span>
-    </div>
-    <div class="gwrap">
-      <div id="cy"></div>
-      <div class="empty" id="gEmpty">Select a case from the queue, or press <span class="mono">&nbsp;Replay queue&nbsp;</span>.</div>
-      <details class="onto" id="onto"><summary>◇ Ontology · proof.owl</summary><div class="tree" id="ontoTree"></div></details>
-      <div class="tools"><button class="hbtn" id="fitBtn" title="Fit (f)">Fit</button><button class="hbtn" id="pngBtn" title="Export PNG">PNG</button></div>
-      <div class="legend" id="legend"></div>
-      <div class="tip" id="tip"></div>
-    </div>
-    <section class="doc" id="doc">
-      <div class="dhead"><span class="label">Document</span><span class="mono" id="dId"></span><span class="tchip" id="dType"></span><span class="sub" id="dTitle"></span>
-        <span class="cust" style="margin-left:12px"><mark class="sup">supports</mark>&nbsp;<mark class="con">contradicts</mark></span>
-        <button class="hbtn x" id="dClose" title="Close (Esc)">✕</button></div>
-      <div class="dbody" id="dBody"></div>
-    </section>
-  </main>
-
-  <aside class="right" id="right">
-    <div class="sec"><div class="empty" style="position:static;padding:30px 0">No case selected.</div></div>
-  </aside>
-
-  <section class="timeline">
-    <div class="tlhead"><span class="label">Transaction timeline</span><span class="k" id="tlKey"></span></div>
-    <div class="tlwrap" id="tl"></div>
-  </section>
+  </nav>
+  <main class="main" id="main" tabindex="-1"></main>
 </div>
+<div class="pop" id="pop"></div>
 <script src="vendor/cytoscape.min.js"></script>
 <script src="vendor/dagre.min.js"></script>
 <script src="vendor/cytoscape-dagre.js"></script>
 <script src="vendor/marked.min.js"></script>
 <script src="data/index.js"></script>
 <script src="data/ontology.js"></script>
+<script src="import.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

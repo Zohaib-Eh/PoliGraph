@@ -112,3 +112,10 @@ One JSON line per case:
 
 ## 6. Determinism
 Inputs are read in file order; documents are sorted by ID and transactions by time and ID. There's no set iteration in the output paths, and keys are in a fixed order. Five repeated runs give byte-identical output. Policy constants live at the top of `run` (`POLICY`, `OWN_ACCOUNT_RFI_MULTIPLE`, `CLOSE_PRIORITY`, `EXPLAIN_TYPES`). Nothing from the dev set (case IDs, names, amounts) is hard-coded.
+
+## Approved policy overrides (optional)
+`system/run <folder> <out.jsonl> --policy=policy-overrides.json` applies an approved change from the viewer's Import page
+(`{"schema": "poligraph.policy-overrides/1", "institution": "bank", "overrides": {...}}`). Keys: `tm02_min`,
+`invoice_required_gbp`, `own_account_rfi_multiple`, `tm01_limit_multiple_individual`, `tm01_limit_multiple_business`
+(null = use the alert's own limit). Unknown keys are rejected. Without the flag the defaults from POLICY.md apply and
+outputs are byte-identical to the official run.

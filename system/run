@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Deterministic transaction-monitoring alert triage.
 
-usage: run <institution_folder> <output.jsonl> [--trace]
+usage: run <institution_folder> <output.jsonl> [--trace] [--policy=overrides.json]
 
 Reads only the given institution folder. Writes only the output file and,
 with --trace, <output>.trace.jsonl (a per-case knowledge graph + proof trace).
@@ -23,6 +23,40 @@ POLICY = {
     "investment":  {"tm02_min": 2000.0, "invoice_required_gbp": None},
     "payments_fx": {"tm02_min": 2000.0, "invoice_required_gbp": 10000.0},
 }
+# Settings an approved policy change may override (run ... --policy=policy-overrides.json).
+# None = use the value the monitoring system put on the alert. Defaults leave outputs byte-identical.
+POLICY_KEYS = {
+    "tm02_min": "TM02: unexplained money in at or above this (GBP) keeps the alert open",
+    "invoice_required_gbp": "Held payment to a non-client at or above this (GBP) needs an invoice (payments_fx)",
+    "own_account_rfi_multiple": "Own-account money at this multiple of profile or more needs an updated profile",
+    "tm01_limit_multiple_individual": "TM01: tolerated multiple of declared monthly income (individuals)",
+    "tm01_limit_multiple_business": "TM01: tolerated multiple of declared monthly turnover (businesses)",
+}
+for _p in POLICY.values():
+    _p.setdefault("own_account_rfi_multiple", OWN_ACCOUNT_RFI_MULTIPLE)
+    _p.setdefault("tm01_limit_multiple_individual", None)
+    _p.setdefault("tm01_limit_multiple_business", None)
+
+
+def load_policy_overrides(path, inst):
+    """Merge an approved override file into POLICY[inst]. Format (written by the viewer's Approve step):
+    {"schema": "poligraph.policy-overrides/1", "institution": "<inst>" (optional, else all),
+     "overrides": {"<key>": <number or null>, ...}, "version": n, "approved_by": "...", "reason": "..."}"""
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    ov = doc.get("overrides", doc)
+    target = doc.get("institution")
+    if target and target != inst:
+        return {}
+    applied = {}
+    for k, v in sorted(ov.items()):
+        if k not in POLICY_KEYS:
+            raise ValueError("unknown policy key %r" % k)
+        if v is not None and not isinstance(v, (int, float)):
+            raise ValueError("policy key %r must be a number or null" % k)
+        POLICY.setdefault(inst, dict(POLICY["bank"]))[k] = None if v is None else float(v)
+        applied[k] = v
+    return applied
 BOILERPLATE = {"due_diligence_summary", "proof_of_address", "contact_note"}
 VERDICT_OF = {
     "COLLECTION_DOCUMENTED": "CLOSE", "BUSINESS_RECORDS_RECONCILE": "CLOSE", "DOCUMENTED_EVENT": "CLOSE",
@@ -1369,7 +1403,8 @@ def reconcile(cs, a, covered, onward_credit):
             own_in = sum(t["amount_gbp"] for t in txs if t["direction"] == "in" and cs.is_self(t.get("counterparty_name"))
                          and t["transaction_id"] not in covered)
             ex_in += min(onward_credit, own_in)
-        limit = (m.get("limit_multiple") or 0) * (m.get("baseline_gbp") or 0)
+        lm = cs.pol.get("tm01_limit_multiple_" + ("business" if cs.cust.get("kind") == "business" else "individual"))
+        limit = ((m.get("limit_multiple") or 0) if lm is None else lm) * (m.get("baseline_gbp") or 0)
         rest = round(received - ex_in, 2)
         rec["unexplained_txns"] = [t["transaction_id"] for t in txs if t["direction"] == "in" and
                                    t["transaction_id"] not in covered and not (cs.profile_explained(t) and
@@ -1620,13 +1655,13 @@ def decide(cs):
         es = [e for t in a["transaction_ids"] for e in covered.get(t, [])]
         if cs.inst == "payments_fx" and not [e for e in es if e.direction_in(cs)]:
             es = es + [e for e in expls if e.onward > 0]
-        if es and all(e.code == "OWN_ACCOUNT" for e in es) and (m.get("multiple") or 0) >= OWN_ACCOUNT_RFI_MULTIPLE:
+        if es and all(e.code == "OWN_ACCOUNT" for e in es) and (m.get("multiple") or 0) >= cs.pol["own_account_rfi_multiple"]:
             docs = sorted(set(d for e in es for d in e.docs))
             reason = ("Alert %s: %s received in the window, %.1fx the declared monthly %s. %s shows the money came from "
                       "the customer's own account, but activity at %.0fx or more of the declared profile needs an "
                       "updated profile; ask the customer to confirm their expected monthly activity and the reason for "
                       "the change." % (a["alert_id"], fmt(m.get("received_gbp") or 0), m.get("multiple") or 0,
-                                       fmt(m.get("baseline_gbp") or 0), ", ".join(docs), OWN_ACCOUNT_RFI_MULTIPLE))
+                                       fmt(m.get("baseline_gbp") or 0), ", ".join(docs), cs.pol["own_account_rfi_multiple"]))
             cs.fire("R_OWN_ACCOUNT_PROFILE_UPDATE", "RFI_UPDATED_PROFILE", [])
             return "RFI_UPDATED_PROFILE", reason, [a["alert_id"]] + docs, trace
     # 5. CLOSE: every alert reconciled
@@ -2030,11 +2065,15 @@ def run_case(world, case, want_kg=False):
 def main(argv):
     args = [a for a in argv[1:] if not a.startswith("--")]
     trace = "--trace" in argv
+    pol = [a.split("=", 1)[1] for a in argv[1:] if a.startswith("--policy=")]
     if len(args) != 2:
-        sys.stderr.write("usage: run <institution_folder> <output.jsonl> [--trace]\n")
+        sys.stderr.write("usage: run <institution_folder> <output.jsonl> [--trace] [--policy=overrides.json]\n")
         return 2
     folder, outp = args
     world = World(folder)
+    if pol:
+        applied = load_policy_overrides(pol[0], world.inst)
+        sys.stderr.write("policy overrides for %s: %s\n" % (world.inst, json.dumps(applied, sort_keys=True)))
     lines, tlines, kg, falls = [], [], set(), 0
     for case in world.cases:
         try:

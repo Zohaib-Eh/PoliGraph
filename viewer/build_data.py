@@ -181,10 +181,134 @@ def highlights(doc_id, o, t, tx, cname):
     return {"sup": sorted(sup, key=lambda s: -len(s)), "con": sorted(con, key=lambda s: -len(s))}
 
 
-def build(inst, detail_n, runs):
-    base = os.path.join(ROOT, "institutions", inst)
-    outs = jl(os.path.join(ROOT, "output", inst + ".jsonl"))
-    traces = {t["case_id"]: t for t in jl(os.path.join(ROOT, "output", inst + ".jsonl.trace.jsonl"))}
+RULE_WORDS = {"TM01": "Activity above declared profile", "TM02": "Money in and straight out", "TM03": "Payments just under a threshold",
+              "TM04": "Many counterparties", "TM05": "Large cash", "TM06": "Higher-risk country", "TM07": "Dormant account reactivated",
+              "TM08": "Third-party money", "TM10": "Early fund redemption", "TM22": "Internal watch-list match"}
+
+
+def _d(iso):
+    return dtxt(iso) or str(iso or "")
+
+
+def _short(iso):
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", str(iso or ""))
+    return "%d %s" % (int(m.group(3)), MONTHS[int(m.group(2)) - 1][:3]) if m else str(iso or "")
+
+
+def build_story(o, t, tx, alerts, cust, docs_by_id):
+    """Plain-English check cards, generated deterministically from the trace (no LLM)."""
+    facts = {f["id"]: f for f in t.get("facts", [])}
+    fl = t.get("facts", [])
+    cards = []
+    def card(status, title, detail, docs, weight=0):
+        cards.append({"status": status, "title": title, "detail": detail, "docs": [x for x in docs if x], "w": weight})
+    kinds = defaultdict(list)
+    for f in fl:
+        kinds[f["kind"]].append(f)
+    lr = {x.get("entry"): x for x in t.get("list_resolution", [])}
+    lname = next((x.get("lname") for x in t.get("list_resolution", []) if x.get("lname")), "the listed person")
+    docsrc = lambda f: [x for x in f["sources"] if x in docs_by_id]
+    # suspicion and list facts
+    for f in kinds["listed_person_controlled_counterparty_at_payment"]:
+        pct = re.search(r"\((\d+%)\)", f.get("control") or "")
+        res = kinds["officer_resigned_before_payment"]
+        lead = ("Resigned as director %s, but " % _short(res[0]["resigned"])) if res else ""
+        card("fail", "%s still controlled the payee when it was paid" % lname,
+             "%sheld %s until %s; the payment was on %s." % (lead, pct.group(1) if pct else "control",
+                                                            _short(f.get("ceased")) if f.get("ceased") else "now",
+                                                            _short(f.get("payment"))),
+             docsrc(f) + [x for r in res for x in r["sources"]], 10)
+    for f in kinds["counterparty_dob_equals_list_dob"]:
+        card("fail", "Donor's date of birth matches the list entry", "Born %s, the same as %s on the internal list." % (
+            _d(f["dob"]), lname), docsrc(f), 10)
+    for f in kinds["counterparty_dob_differs_from_list"]:
+        card("pass", "Different person from the list entry", "Donor born %s; %s was born %s." % (
+            _d(f["dob"]), lname, _d(f.get("list_dob"))), docsrc(f), 6)
+    for f in kinds["counterparty_address_differs_from_list"]:
+        card("pass", "Different party from the list entry", "Payee is at %s; %s is linked to %s." % (
+            f.get("counterparty_unit"), lname, f.get("list_unit")), docsrc(f), 6)
+    for f in kinds.get("officer_birth_differs_from_list", []):
+        card("pass", "Different person from the list entry", "Register birth date differs from %s's." % lname, docsrc(f), 6)
+    sc = kinds["scam_report_sender_paid_customer"]
+    if sc:
+        senders = sorted(set(f.get("sender") for f in sc if f.get("sender")))
+        card("fail", "%d scam report%s name people who paid this account" % (len(sc), "" if len(sc) == 1 else "s"),
+             "Senders %s, %s in total." % (", ".join(senders[:3]), fmt(sum(f.get("amount") or 0 for f in sc))),
+             sorted(set(x for f in sc for x in docsrc(f))), 10)
+    TPL = {
+        "customer_invests_for_third_parties": ("Customer says they handle other people's money", lambda f: "\u201c%s\u201d" % f.get("quote", "")),
+        "payer_company_dissolved_before_payment": ("Payer company no longer existed", lambda f: "%s was dissolved on %s, before it paid." % (f.get("company"), _d(f.get("dissolved_on")))),
+        "customer_asked_how_to_avoid_threshold": ("Customer asked how to stay under a threshold", lambda f: "Recorded in a staff note."),
+        "split_payments_to_unrelated_people_in_high_risk_country": ("Money split between unrelated people in %s", lambda f: "No document shows who they are."),
+        "funds_routed_to_new_companies_of_same_director": ("Money passed on to the director's new companies", lambda f: "Companies set up recently by %s." % (f.get("director") or "").title()),
+        "device_shared_with_other_customers": ("Device shared with other customers", lambda f: "%d customer IDs use it; logins from %s." % (len(f.get("customers") or []), f.get("countries"))),
+        "client_cannot_explain_corridor": ("Client can't explain the routing to %s", lambda f: "Recorded in a staff note."),
+        "invoice_goods_inconsistent_with_business": ("Invoices don't fit the business", lambda f: "%s, for a business that %s." % (f.get("goods"), (f.get("business_activity") or "").lower())),
+        "payees_share_addresses_inconsistent_with_country": ("Payees abroad share UK addresses", lambda f: "%s payees listed abroad have UK addresses." % f.get("uk_address_abroad")),
+        "customer_gives_conflicting_explanations": ("Customer gave conflicting stories", lambda f: "%s, then %s." % (" / ".join(f.get("first") or []), " / ".join(f.get("second") or []))),
+        "suspicion_keyword": ("Documents mention %s", lambda f: "Unexplained activity plus a fraud indicator."),
+    }
+    for k, (title, det) in TPL.items():
+        for f in kinds.get(k, [])[:1]:
+            tt = title % (f.get("country") or f.get("word") or "") if "%s" in title else title
+            card("fail", tt, det(f), docsrc(f) or f["sources"][:2], 9)
+    # explanations (decisive and advisory)
+    seen_docs = set()
+    for fr in t.get("firings", []):
+        if not re.match(r"X\d+_", fr["rule"]):
+            continue
+        ds = [d for d in fr.get("docs", []) if d in docs_by_id]
+        if not ds or ds[0] in seen_docs:
+            continue
+        seen_docs.add(ds[0])
+        txs = sorted([tx[x] for x in fr.get("txns", []) if x in tx], key=lambda x: -x["amount_gbp"])
+        d0 = docs_by_id[ds[0]]
+        what = d0.get("type", "").replace("_", " ")
+        if fr["rule"] == "X2_own_account_statement":
+            title = "Statement %s proves it's the customer's own account" % ds[0]
+        else:
+            title = "%s %s matches %s" % (what[:1].upper() + what[1:], ds[0], fmt(txs[0]["amount_gbp"]) if txs else "the amounts")
+        det = ("%s %s %s on %s" % (fmt(txs[0]["amount_gbp"]), "from" if txs[0]["direction"] == "in" else "to",
+                                   txs[0].get("counterparty_name") or "cash", _short(txs[0]["booked_at"]))) if txs else ""
+        if len(txs) > 1:
+            det += " and %d more" % (len(txs) - 1)
+        card("pass", title, det + ".", ds, 5)
+    # reconciliation per alert
+    for r in t.get("reconciliation", []):
+        words = RULE_WORDS.get(r["rule"], r["rule"])
+        if not r["cleared"] and r["rule"] != "TM22":
+            card("info", "%s of %s has no supporting document" % (fmt(r["unexplained_gbp"]), fmt(r["alerted_gbp"])),
+                 "%s alert %s is still open." % (words, r["alert_id"]), r.get("explained_by", []), 8)
+        if r.get("profile_gbp", 0) > 0 and not any(c["title"].startswith("Regular activity") for c in cards):
+            card("pass", "Regular activity: %s" % fmt(r["profile_gbp"]), "Within the declared profile (e.g. salary, card takings).", [], 2)
+    for x in t.get("list_resolution", []):
+        if x.get("status") == "unsettled":
+            card("info", "Name-only match with %s" % x.get("lname"), "Nothing on file settles whether it is the same person.",
+                 [x.get("entry")], 9)
+    if o["reason_code"] == "RFI_UPDATED_PROFILE":
+        card("info", "Own money, but far above the declared profile", "Activity is 5x or more of what the customer declared.", [], 9)
+    order = {"fail": 0, "info": 1, "pass": 2}
+    cards.sort(key=lambda c: (order[c["status"]], -c["w"]))
+    if o["verdict"] == "CLOSE":
+        card("pass", "Nothing left unexplained", "Every alerted pound is booked against evidence: %s unexplained." % fmt(0), [], 1)
+        card("pass", "No red flags", "None of the suspicion rules fired on this customer's documents.", [], 0)
+        cards.sort(key=lambda c: (order[c["status"]], -c["w"]))
+    for c in cards:
+        c.pop("w", None)
+    money = []
+    for a in alerts:
+        amt = sum(tx[x]["amount_gbp"] for x in set(a["transaction_ids"]) if x in tx)
+        money.append({"alert": a["alert_id"], "rule": a["rule_id"], "words": RULE_WORDS.get(a["rule_id"], a["rule_id"]),
+                      "amount": round(amt, 2)})
+    return {"money": money, "checks": cards[:5], "more": max(0, len(cards) - 5)}
+
+
+def build(inst, detail_n, runs, base=None, out=None, extra=()):
+    """Bundle for one institution. base/out default to the repo; the in-browser Import page passes its own."""
+    base = base or os.path.join(ROOT, "institutions", inst)
+    out = out or os.path.join(ROOT, "output", inst + ".jsonl")
+    outs = jl(out)
+    traces = {t["case_id"]: t for t in jl(out + ".trace.jsonl")}
     cases = {c["case_id"]: c for c in jl(os.path.join(base, "cases.jsonl"))}
     alerts = {a["alert_id"]: a for a in jl(os.path.join(base, "alerts.jsonl"))}
     custs = {c["customer_id"]: c for c in jl(os.path.join(base, "customers.jsonl"))}
@@ -205,6 +329,8 @@ def build(inst, detail_n, runs):
     for o in outs:
         by_code[o["reason_code"]].append(o["case_id"])
     chosen = [c for c in demos.values() if c]
+    chosen += [c for c in extra if c not in chosen]
+    detail_n += len(chosen) - len([c for c in demos.values() if c])
     i = 0
     while len(chosen) < min(detail_n, len(outs)):
         added = False
@@ -228,7 +354,9 @@ def build(inst, detail_n, runs):
         rows.append({"id": o["case_id"], "name": cust.get("name", ""), "rules": [a["rule_id"] for a in als],
                      "amount": amt, "verdict": o["verdict"], "code": o["reason_code"],
                      "alerts": len(o["alert_ids"]), "detail": o["case_id"] in chosen,
-                     "reason": o["reason"], "evidence": o["evidence"], "alert_ids": o["alert_ids"]})
+                     "reason": o["reason"], "evidence": o["evidence"], "alert_ids": o["alert_ids"],
+                     "fired": sorted(set(re.sub(r"^R_TM22_.*", "R_TM22", f["rule"]) for f in traces[o["case_id"]]["firings"]
+                                         if not f.get("advisory")))})
         if o["case_id"] not in chosen:
             continue
         t = traces[o["case_id"]]
@@ -270,6 +398,7 @@ def build(inst, detail_n, runs):
             "recon": recon_segments(o, t, tx, cust.get("name")),
             "timeline": tl, "docs": docs,
             "reviews": reviews_by.get(c["customer_id"], []),
+            "story": build_story(o, t, tx, als, cust, {d["doc_id"]: d for d in docs_by[c["customer_id"]]}),
             "list": [listed[e] for e in sorted(set(n["id"] for n in t["nodes"] if n["type"] == "list_entry"))
                      if e in listed],
         }
@@ -311,9 +440,25 @@ def ontology_js():
         fh.write("window.PROOF_ONTOLOGY = %s;\n" % json.dumps(data, ensure_ascii=False, sort_keys=True))
 
 
+def engine_js():
+    """Engine + bundle builder sources and policy defaults, for the in-browser (Pyodide) Import page."""
+    import importlib.machinery, importlib.util
+    ld = importlib.machinery.SourceFileLoader("proof_run", os.path.join(ROOT, "system", "run"))
+    spec = importlib.util.spec_from_loader("proof_run", ld)
+    eng = importlib.util.module_from_spec(spec)
+    ld.exec_module(eng)
+    run_src = open(os.path.join(ROOT, "system", "run"), encoding="utf-8").read()
+    bd_src = open(os.path.abspath(__file__), encoding="utf-8").read()
+    data = {"run": run_src, "build": bd_src, "policy": eng.POLICY, "keys": eng.POLICY_KEYS,
+            "run_sha256": hashlib.sha256(run_src.encode("utf-8")).hexdigest()}
+    with open(os.path.join(ROOT, "viewer", "data", "engine.js"), "w", encoding="utf-8") as fh:
+        fh.write("window.PG_ENGINE = %s;\n" % json.dumps(data, ensure_ascii=False, sort_keys=True))
+
+
 def main():
     detail_n, runs = arg("--detail", 200), arg("--runs", 5)
     ontology_js()
+    engine_js()
     bp = os.path.join(ROOT, "viewer", "data", "briefs.json")
     briefs = json.load(open(bp, encoding="utf-8")) if os.path.exists(bp) else {}
     os.makedirs(os.path.join(ROOT, "viewer", "data"), exist_ok=True)

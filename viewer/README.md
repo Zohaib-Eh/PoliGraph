@@ -1,25 +1,23 @@
-# PROOF analyst workbench (static, offline)
+# PoliGraph viewer (static, offline)
 
-Open `viewer/index.html` directly in a browser (file:// works with no server). Every library and font is vendored in `vendor/`.
+Multi-page app (hash routing, vanilla JS, vendored libs): Overview `#/`, Queue `#/queue`, Case `#/case/<id>/<decision|why|documents|timeline>`,
+Rules `#/rules`, How it works `#/about`, Import `#/import`. Open `viewer/index.html` from file:// for everything except Import.
+The previous single-screen workbench is kept in `viewer/legacy/`.
+
+## Import + policy what-if (needs http, because WebAssembly can't load from file://)
+```
+python3 -m http.server -d viewer 8000   # then http://localhost:8000/#/import
+```
+Drop an institution folder or .zip (or pick a sample from `data/inst/*.zip`): the exact `system/run` runs in the browser via
+Pyodide (`vendor/pyodide`), the result is checked byte for byte against the bundled official output hash, and opens in the
+same queue/case UI (session only). Engine output (.jsonl/.trace.jsonl/.csv) can also be loaded view-only.
+Policy what-if re-runs every case with edited thresholds, shows the verdict diff, and an Approve step records a versioned
+change (old/new, approver, reason, time, impact) in localStorage with Pending/Approved/Reverted status and a download of
+`policy-overrides.json` for `system/run --policy=policy-overrides.json`.
 
 ## Rebuild the data bundle after a new engine run
 ```
 system/run institutions/<inst> output/<inst>.jsonl --trace     # for each institution
-python3 viewer/build_data.py              # data/<inst>.js + data/ontology.js, with a fresh 5-run determinism fingerprint
-python3 viewer/make_briefs.py --limit 200 # optional plain-English briefs (Grok if XAI_API_KEY is set, else a template), fact-checked
-python3 viewer/build_data.py --runs 5     # merge the briefs into the bundle
+python3 viewer/build_data.py --runs 5   # data/<inst>.js, ontology.js, engine.js (engine source for Import), 5-run fingerprint
+python3 viewer/make_briefs.py --limit 200   # optional briefs, then build_data.py again
 ```
-Options:
-- `--detail N`: number of graph-ready cases per institution (default 200, including the three pinned demo cases; `--detail 1000` includes all of them, about 15 MB per institution).
-- `--runs 0`: skip the five re-runs.
-
-**Load trace…** in the header accepts a fresh `*.trace.jsonl` (plus its `*.jsonl`) without a rebuild.
-
-## Keys
-| Key | Action |
-|---|---|
-| `j` / `k` | queue |
-| `Enter` | open |
-| `f` | fit |
-| `p` | presentation size |
-| `Esc` | clear |
